@@ -7,6 +7,7 @@ import {
   Square,
   Award,
   Volume2,
+  VolumeX,
   RefreshCw,
   Gauge,
   Sliders,
@@ -29,6 +30,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 }) => {
   const [isPracticing, setIsPracticing] = useState(false);
   const [micActive, setMicActive] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
   const [transposeSemitones, setTransposeSemitones] = useState<number>(0);
   const [livePitch, setLivePitch] = useState<LivePitchData | null>(null);
@@ -40,6 +42,17 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const trackerRef = useRef<MicPitchTracker | null>(null);
   const userPitchHistory = useRef<PitchFrame[]>([]);
   const animRef = useRef<number | null>(null);
+
+  // Sync mute state with reference audio element
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.muted = isMuted;
+    }
+  }, [isMuted]);
+
+  const toggleMute = () => {
+    setIsMuted((prev) => !prev);
+  };
 
   // Transpose notes for practice if user changes key
   const effectiveNotes: NoteItem[] = transcription.notes.map((n) => {
@@ -87,6 +100,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         audioRef.current.currentTime = 0;
         audioRef.current.playbackRate = playbackSpeed;
         audioRef.current.preservesPitch = true;
+        audioRef.current.muted = isMuted;
         await audioRef.current.play();
       }
 
@@ -252,6 +266,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         src={getAudioFileUrl(audioId)}
         onEnded={stopPracticeSession}
         preload="auto"
+        muted={isMuted}
       />
 
       {/* Practice Header & Controls Bar */}
@@ -280,8 +295,22 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             </div>
           </div>
 
-          {/* Action Button: Start / Stop Practice */}
-          <div className="flex items-center gap-3">
+          {/* Action Buttons: Mute Toggle + Start / Stop Practice */}
+          <div className="flex items-center gap-2.5">
+            {/* Track Mute / Unmute Icon */}
+            <button
+              onClick={toggleMute}
+              className={`p-2.5 rounded-xl border transition-all flex items-center justify-center ${
+                isMuted
+                  ? 'bg-rose-950/70 border-rose-700/70 text-rose-400 hover:bg-rose-900/80 shadow-md shadow-rose-950/50'
+                  : 'bg-slate-950/90 border-slate-800 text-slate-300 hover:text-cyan-300 hover:border-slate-700 shadow-sm'
+              }`}
+              title={isMuted ? "Unmute Reference Track" : "Mute Reference Track (Sing A Cappella)"}
+              aria-label={isMuted ? "Unmute Reference Track" : "Mute Reference Track"}
+            >
+              {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+            </button>
+
             {!isPracticing ? (
               <button
                 onClick={startPracticeSession}
