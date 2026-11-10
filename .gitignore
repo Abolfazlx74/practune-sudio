@@ -15,13 +15,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Audio storage & exports (binary audio files)
+# Audio storage & exports (binary audio files & temp cache)
 backend/storage/uploads/*
 backend/storage/processed/*
 backend/storage/exports/*
+backend/storage/transcriptions/*
 !backend/storage/uploads/.gitkeep
 !backend/storage/processed/.gitkeep
 !backend/storage/exports/.gitkeep
+!backend/storage/transcriptions/.gitkeep
 *.wav
 *.mp3
 *.flac

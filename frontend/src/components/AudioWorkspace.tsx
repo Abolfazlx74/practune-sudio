@@ -16,6 +16,8 @@ import {
   Scissors,
   Check,
   X,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import type { AudioInfo, PreprocessOptions } from '../types';
 import {
@@ -49,6 +51,9 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
   const [rangeEnd, setRangeEnd] = useState<number>(0);
   const [isRangeActive, setIsRangeActive] = useState(false);
 
+  // Waveform Zoom State (1.0x = full view fit, up to 8.0x)
+  const [waveformZoom, setWaveformZoom] = useState<number>(1.0);
+
   // Cut / Trim Tool States
   // 'idle' -> 'start-set' -> 'end-set'
   const [cutStep, setCutStep] = useState<'idle' | 'start-set' | 'end-set'>('idle');
@@ -69,6 +74,7 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
   const activeAudio = activeVersion === 'processed' && processedAudio ? processedAudio : audioInfo;
 
@@ -82,6 +88,7 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
       setCutStep('idle');
       setCutStart(null);
       setCutEnd(null);
+      setWaveformZoom(1.0);
     }
   }, [activeAudio?.id]);
 
@@ -116,17 +123,34 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     };
   }, [isLooping, isRangeActive, rangeStart, rangeEnd]);
 
+  // Auto-scroll when zoomed in to keep playhead in view
+  useEffect(() => {
+    if (!scrollContainerRef.current || waveformZoom <= 1.0 || !activeAudio) return;
+    const container = scrollContainerRef.current;
+    const totalW = container.clientWidth * waveformZoom;
+    const cursorX = (currentTime / activeAudio.duration) * totalW;
+
+    if (cursorX > container.scrollLeft + container.clientWidth - 120 || cursorX < container.scrollLeft) {
+      container.scrollLeft = Math.max(0, cursorX - container.clientWidth / 3);
+    }
+  }, [currentTime, waveformZoom, activeAudio]);
+
   // Render Interactive Waveform
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !activeAudio) return;
+    const container = scrollContainerRef.current;
+    if (!canvas || !activeAudio || !container) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
+    const containerWidth = container.clientWidth || 800;
+    const width = Math.max(containerWidth, Math.round(containerWidth * waveformZoom));
+    const height = 144;
+
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
     canvas.width = width * dpr;
     canvas.height = height * dpr;
     ctx.scale(dpr, dpr);
@@ -137,35 +161,41 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     ctx.fillStyle = '#070b12';
     ctx.fillRect(0, 0, width, height);
 
-    // Subtle time markers
+    const duration = activeAudio.duration || 1;
+
+    // Dynamic Time Markers based on zoom
     ctx.strokeStyle = '#1e293b';
     ctx.lineWidth = 1;
-    const duration = activeAudio.duration || 1;
-    const numMarkers = 8;
-    for (let i = 0; i <= numMarkers; i++) {
-      const x = (i / numMarkers) * width;
+    const markerStep = waveformZoom >= 4.0 ? 0.25 : waveformZoom >= 2.0 ? 0.5 : 1.0;
+    for (let t = 0; t <= duration; t += markerStep) {
+      const x = (t / duration) * width;
       ctx.beginPath();
       ctx.moveTo(x, 0);
       ctx.lineTo(x, height);
       ctx.stroke();
 
-      const timeText = ((i / numMarkers) * duration).toFixed(1) + 's';
-      ctx.fillStyle = '#475569';
+      const timeText = t.toFixed(markerStep < 1 ? 2 : 1) + 's';
+      ctx.fillStyle = '#64748b';
       ctx.font = '10px monospace';
-      ctx.fillText(timeText, x + 4, 12);
+      ctx.fillText(timeText, x + 4, 14);
     }
 
     // Waveform peaks
     const peaks = activeAudio.waveform_overview.length > 0
       ? activeAudio.waveform_overview
       : Array(120).fill(0.3);
-    const barWidth = width / peaks.length;
+
+    // Dynamic bar calculation for high zoom detail
+    const totalBars = Math.max(peaks.length, Math.round(peaks.length * waveformZoom));
+    const barWidth = width / totalBars;
     const halfH = height / 2;
 
-    peaks.forEach((peak, i) => {
+    for (let i = 0; i < totalBars; i++) {
+      const peakIdx = Math.floor((i / totalBars) * peaks.length);
+      const peak = peaks[peakIdx] || 0.1;
       const x = i * barWidth;
       const barH = Math.max(2, peak * (height * 0.72));
-      const peakTime = (i / peaks.length) * duration;
+      const peakTime = (i / totalBars) * duration;
       const isPast = peakTime <= currentTime;
 
       const gradient = ctx.createLinearGradient(0, halfH - barH / 2, 0, halfH + barH / 2);
@@ -181,7 +211,7 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
 
       ctx.fillStyle = gradient;
       ctx.fillRect(x + 0.5, halfH - barH / 2, Math.max(1, barWidth - 1), barH);
-    });
+    }
 
     // Dimming overlays & Cut Region Markers
     if (cutStart !== null && cutEnd !== null && cutEnd > cutStart) {
@@ -189,14 +219,14 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
       const endX = (cutEnd / duration) * width;
 
       // Dim outer areas (to clearly show what will be cut out)
-      ctx.fillStyle = 'rgba(2, 6, 23, 0.7)';
+      ctx.fillStyle = 'rgba(2, 6, 23, 0.72)';
       ctx.fillRect(0, 0, startX, height);
       ctx.fillRect(endX, 0, width - endX, height);
 
       // Highlight selected slice
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.12)';
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.14)';
       ctx.fillRect(startX, 0, endX - startX, height);
-      ctx.strokeStyle = 'rgba(245, 158, 11, 0.4)';
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.5)';
       ctx.strokeRect(startX, 0, endX - startX, height);
 
       // Centered Floating Badge between cut points
@@ -205,7 +235,7 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
       const centerLabel = `✂ Selected Slice: ${sliceDuration}s`;
       ctx.font = 'bold 10px monospace';
       const labelW = ctx.measureText(centerLabel).width + 16;
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.95)';
       ctx.strokeStyle = '#f59e0b';
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -282,7 +312,19 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     ctx.beginPath();
     ctx.arc(cursorX, 6, 4, 0, Math.PI * 2);
     ctx.fill();
-  }, [activeAudio, currentTime, isRangeActive, rangeStart, rangeEnd, cutStart, cutEnd]);
+  }, [activeAudio, currentTime, isRangeActive, rangeStart, rangeEnd, cutStart, cutEnd, waveformZoom]);
+
+  // Mouse Wheel Zoom on Waveform
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) {
+      e.preventDefault();
+      if (e.deltaY < 0) {
+        setWaveformZoom((z) => Math.min(8.0, Number((z + 0.5).toFixed(1))));
+      } else {
+        setWaveformZoom((z) => Math.max(1.0, Number((z - 0.5).toFixed(1))));
+      }
+    }
+  };
 
   // Click & Seek on Waveform
   const handleWaveformClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -299,7 +341,6 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     if (cutStep === 'start-set' && cutStart === null) {
       setCutStart(Math.round(newTime * 100) / 100);
     } else if (cutStep === 'start-set' && cutStart !== null && cutEnd === null) {
-      // User clicked again: can set end
       const start = Math.min(cutStart, Math.round(newTime * 100) / 100);
       const end = Math.max(cutStart, Math.round(newTime * 100) / 100);
       setCutStart(start);
@@ -313,17 +354,14 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     if (!activeAudio) return;
 
     if (cutStep === 'idle') {
-      // 1st click: Mark start cut point at current playback time
       const start = Math.round(currentTime * 100) / 100;
       setCutStart(start);
       setCutEnd(null);
       setCutStep('start-set');
     } else if (cutStep === 'start-set') {
-      // 2nd click: Mark end cut point at current playback time
       let end = Math.round(currentTime * 100) / 100;
       let start = cutStart ?? 0;
       if (end <= start) {
-        // If playhead hasn't moved or is behind, set end to start + 3s or duration
         end = Math.min(activeAudio.duration, start + 3.0);
       }
       setCutStart(Math.min(start, end));
@@ -332,14 +370,12 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     }
   };
 
-  // Reset Cut Selection
   const handleCancelCut = () => {
     setCutStep('idle');
     setCutStart(null);
     setCutEnd(null);
   };
 
-  // Apply Cut (Trim Audio)
   const handleApplyCut = async () => {
     if (!activeAudio || cutStart === null || cutEnd === null) return;
     setIsTrimming(true);
@@ -499,57 +535,99 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
             </div>
           </div>
 
-          {/* A/B Switcher if processed version exists */}
-          {processedAudio && (
-            <div className="flex items-center gap-2 bg-slate-950/90 border border-slate-800 p-1 rounded-xl">
-              <button
-                onClick={() => {
-                  setActiveVersion('original');
-                  setIsPlaying(false);
-                }}
-                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
-                  activeVersion === 'original'
-                    ? 'bg-slate-800 text-cyan-400'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                Original Audio
-              </button>
-              <button
-                onClick={() => {
-                  setActiveVersion('processed');
-                  setIsPlaying(false);
-                }}
-                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
-                  activeVersion === 'processed'
-                    ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-700/50'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                Processed Track
-              </button>
-            </div>
-          )}
+          {/* Right Header Controls: A/B Switcher, Zoom Controls, Upload */}
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Waveform Zoom Controls */}
+            {activeAudio && (
+              <div className="flex items-center gap-1 bg-slate-950/90 border border-slate-800 p-1 rounded-xl shadow-xs">
+                <button
+                  onClick={() => setWaveformZoom((z) => Math.max(1.0, Number((z - 0.5).toFixed(1))))}
+                  disabled={waveformZoom <= 1.0}
+                  className="p-1 text-slate-400 hover:text-cyan-300 disabled:opacity-30 transition-colors"
+                  title="Zoom Out Track (-)"
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </button>
+                <span className="text-xs font-mono font-bold text-cyan-400 px-2 min-w-12 text-center select-none">
+                  {Math.round(waveformZoom * 100)}%
+                </span>
+                <button
+                  onClick={() => setWaveformZoom((z) => Math.min(8.0, Number((z + 0.5).toFixed(1))))}
+                  disabled={waveformZoom >= 8.0}
+                  className="p-1 text-slate-400 hover:text-cyan-300 disabled:opacity-30 transition-colors"
+                  title="Zoom In Track (+)"
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </button>
+                {waveformZoom > 1.0 && (
+                  <button
+                    onClick={() => setWaveformZoom(1.0)}
+                    className="px-2 py-0.5 text-[10px] font-semibold text-slate-400 hover:text-cyan-300 border-l border-slate-800 transition-colors"
+                    title="Reset Zoom to 100%"
+                  >
+                    1x
+                  </button>
+                )}
+              </div>
+            )}
 
-          {/* Upload Button */}
-          <label className="cursor-pointer flex items-center gap-2 px-4 py-2 bg-slate-800/80 hover:bg-slate-800 text-slate-200 hover:text-white border border-slate-700/60 rounded-xl text-xs font-semibold transition-all shadow-sm">
-            <Upload className="w-3.5 h-3.5" />
-            <span>Select Audio File</span>
-            <input
-              type="file"
-              accept=".wav,.mp3,.flac,.ogg"
-              onChange={handleFileUpload}
-              className="hidden"
-            />
-          </label>
+            {/* A/B Switcher if processed version exists */}
+            {processedAudio && (
+              <div className="flex items-center gap-2 bg-slate-950/90 border border-slate-800 p-1 rounded-xl">
+                <button
+                  onClick={() => {
+                    setActiveVersion('original');
+                    setIsPlaying(false);
+                  }}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                    activeVersion === 'original'
+                      ? 'bg-slate-800 text-cyan-400'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Original Audio
+                </button>
+                <button
+                  onClick={() => {
+                    setActiveVersion('processed');
+                    setIsPlaying(false);
+                  }}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                    activeVersion === 'processed'
+                      ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-700/50'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Processed Track
+                </button>
+              </div>
+            )}
+
+            {/* Upload Button */}
+            <label className="cursor-pointer flex items-center gap-2 px-4 py-2 bg-slate-800/80 hover:bg-slate-800 text-slate-200 hover:text-white border border-slate-700/60 rounded-xl text-xs font-semibold transition-all shadow-sm">
+              <Upload className="w-3.5 h-3.5" />
+              <span>Select Audio File</span>
+              <input
+                type="file"
+                accept=".wav,.mp3,.flac,.ogg"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+            </label>
+          </div>
         </div>
 
-        {/* Waveform Canvas */}
-        <div className="relative rounded-xl overflow-hidden border border-slate-800/90 bg-[#070b12] mb-5">
+        {/* Waveform Canvas with Scrollable Viewport */}
+        <div
+          ref={scrollContainerRef}
+          onWheel={handleWheel}
+          className="relative rounded-xl overflow-x-auto overflow-y-hidden border border-slate-800/90 bg-[#070b12] mb-5 select-none"
+          style={{ minHeight: '144px' }}
+        >
           <canvas
             ref={canvasRef}
             onClick={handleWaveformClick}
-            className="w-full h-36 cursor-crosshair block"
+            className="cursor-crosshair block"
           />
           {!activeAudio && (
             <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-500 gap-2 bg-slate-950/80 backdrop-blur-xs">
