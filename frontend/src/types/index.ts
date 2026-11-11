@@ -77,3 +77,45 @@ export interface EvaluationResponse {
   feedback: string[];
   note_scores: NoteScore[];
 }
+
+export interface PerformanceRecord {
+  id: string;
+  timestamp: string;
+  overall_score: number;
+  pitch_accuracy: number;
+  timing_accuracy: number;
+  sequence_accuracy: number;
+  hit_count: number;
+  total_notes: number;
+  feedback: string[];
+}
+
+export interface PracticeConfigSettings {
+  mode: 'full' | 'note';
+  target_note_name?: string;
+  target_midi?: number;
+  playback_speed: number;
+  transpose_semitones: number;
+  tolerance_cents: number;
+}
+
+export interface PracticeConfiguration {
+  config_id: string;
+  label: string;
+  settings: PracticeConfigSettings;
+  created_at: string;
+  updated_at: string;
+  sessions: PerformanceRecord[];
+  first_score: number;
+  latest_score: number;
+  best_score: number;
+}
+
+export interface HistoryTrack {
+  track_id: string;
+  filename: string;
+  duration: number;
+  created_at: string;
+  last_practiced_at: string;
+  configurations: PracticeConfiguration[];
+}

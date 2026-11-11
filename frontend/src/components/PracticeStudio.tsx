@@ -15,21 +15,31 @@ import {
   History,
   Timer,
 } from 'lucide-react';
-import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame } from '../types';
+import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
 import type { LivePitchData } from '../services/micPitchTracker';
 import { getAudioFileUrl, evaluatePractice } from '../services/api';
 import { synth } from '../services/synth';
+import { recordPracticeSession } from '../services/historyService';
 import { EvaluationModal } from './EvaluationModal';
+import { SmartHistoryModal } from './SmartHistoryModal';
 
 interface PracticeStudioProps {
   transcription: TranscriptionResult;
   audioId: string;
+  audioInfo?: AudioInfo | null;
+  onRestoreTrack?: (
+    audio: AudioInfo,
+    transcription: TranscriptionResult,
+    settings: PracticeConfigSettings
+  ) => void;
 }
 
 export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   transcription,
   audioId,
+  audioInfo,
+  onRestoreTrack,
 }) => {
   // Practice session states
   const [isPracticing, setIsPracticing] = useState(false);
@@ -40,6 +50,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [livePitch, setLivePitch] = useState<LivePitchData | null>(null);
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
   // Pre-Practice Countdown Timer (Enabled by default, 3s default, customizable)
   const [countdownEnabled, setCountdownEnabled] = useState<boolean>(true);
@@ -240,6 +251,26 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           : effectiveNotes;
         const resp = await evaluatePractice(evalTargetNotes, userPitchHistory.current, 50.0);
         setEvaluation(resp);
+
+        // Record session into Smart Performance History
+        const currentSettings: PracticeConfigSettings = {
+          mode: practiceMode,
+          target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
+          target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
+          playback_speed: playbackSpeed,
+          transpose_semitones: transposeSemitones,
+          tolerance_cents: 50.0,
+        };
+
+        recordPracticeSession(
+          audioInfo || {
+            id: audioId,
+            filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
+            duration: duration,
+          },
+          currentSettings,
+          resp
+        );
       } catch (err: any) {
         console.error('Evaluation error:', err);
       } finally {
@@ -543,14 +574,12 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
           {/* Action Buttons: History + Timeline Clock + Mute Toggle + Start / Stop Practice */}
           <div className="flex items-center gap-2.5">
-            {/* Practice History Button (Positioned left of the clock, reserved for next prompt) */}
+            {/* Smart Performance History Button */}
             <button
-              onClick={() => {
-                // Reserved for next prompt implementation
-              }}
+              onClick={() => setIsHistoryOpen(true)}
               className="p-2.5 rounded-xl border border-slate-800 bg-slate-950/90 text-slate-400 hover:text-cyan-300 hover:border-slate-700 shadow-sm transition-all flex items-center justify-center"
-              title="Practice History"
-              aria-label="Practice History"
+              title="Smart Performance History"
+              aria-label="Smart Performance History"
             >
               <History className="w-4 h-4" />
             </button>
@@ -988,6 +1017,38 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           onRetry={() => {
             setEvaluation(null);
             handleStartPracticeClick();
+          }}
+        />
+      )}
+
+      {/* Smart Performance History Modal */}
+      {isHistoryOpen && (
+        <SmartHistoryModal
+          currentAudioId={audioId}
+          onClose={() => setIsHistoryOpen(false)}
+          onApplySettingsOnly={(settings) => {
+            setPlaybackSpeed(settings.playback_speed);
+            if (audioRef.current) {
+              audioRef.current.playbackRate = settings.playback_speed;
+              audioRef.current.preservesPitch = true;
+            }
+            setTransposeSemitones(settings.transpose_semitones);
+            setPracticeMode(settings.mode);
+            if (settings.mode === 'note' && settings.target_note_name) {
+              const matchIdx = effectiveNotes.findIndex(
+                (n) => n.note_name === settings.target_note_name
+              );
+              if (matchIdx >= 0) setSelectedNoteIndex(matchIdx);
+            }
+          }}
+          onRestore={(newAudio, newTranscription, settings) => {
+            if (onRestoreTrack) {
+              onRestoreTrack(newAudio, newTranscription, settings);
+            } else {
+              setPlaybackSpeed(settings.playback_speed);
+              setTransposeSemitones(settings.transpose_semitones);
+              setPracticeMode(settings.mode);
+            }
           }}
         />
       )}

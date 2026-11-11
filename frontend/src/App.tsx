@@ -67,6 +67,12 @@ export function App() {
           <PracticeStudio
             transcription={transcription}
             audioId={audioInfo.id}
+            audioInfo={audioInfo}
+            onRestoreTrack={(newAudio, newTranscription) => {
+              setAudioInfo(newAudio);
+              setTranscription(newTranscription);
+              setActiveTab('practice');
+            }}
           />
         )}
 
