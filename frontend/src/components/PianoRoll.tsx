@@ -8,6 +8,7 @@ interface PianoRollProps {
   currentTime: number;
   duration: number;
   onNotesChange?: (updatedNotes: NoteItem[]) => void;
+  onSeek?: (time: number) => void;
 }
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -22,6 +23,7 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
   currentTime,
   duration,
   onNotesChange,
+  onSeek,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -197,6 +199,9 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
       setDragStartY(clickY);
     } else {
       setSelectedNoteId(null);
+      if (onSeek && clickX >= PIANO_WIDTH) {
+        onSeek(Math.max(0, Math.min(duration, timeAtClick)));
+      }
     }
   };
 
