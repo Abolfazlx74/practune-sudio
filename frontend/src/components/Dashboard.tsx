@@ -264,31 +264,31 @@ export const Dashboard: React.FC<DashboardProps> = ({
                     onNavigateToWorkspace();
                   }
                 }}
-                className="daw-panel p-4 border border-slate-800/80 bg-slate-900/40 hover:bg-slate-900/80 hover:border-cyan-800/60 rounded-2xl cursor-pointer transition-all group shadow-sm overflow-hidden"
+                className="daw-panel min-w-0 p-4 border border-slate-800/80 bg-slate-900/40 hover:bg-slate-900/80 hover:border-cyan-800/60 rounded-2xl cursor-pointer transition-all group shadow-sm overflow-hidden"
               >
-                <div className="flex items-start justify-between gap-2 min-w-0">
+                <div className="flex items-center justify-between gap-3 min-w-0 w-full overflow-hidden">
                   <div className="flex items-center gap-3 min-w-0 flex-1 overflow-hidden">
                     <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-cyan-400 group-hover:bg-cyan-950 transition-colors shrink-0">
                       <FileAudio className="w-4 h-4" />
                     </div>
                     <div className="min-w-0 flex-1 overflow-hidden">
                       <h3
-                        className="text-xs font-semibold text-slate-200 group-hover:text-cyan-300 transition-colors truncate block w-full text-ellipsis overflow-hidden"
+                        className="text-xs font-semibold text-slate-200 group-hover:text-cyan-300 transition-colors truncate block w-full overflow-hidden"
                         title={item.name}
                       >
                         {item.name}
                       </h3>
-                      <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5">
-                        <span className="flex items-center gap-1 font-mono">
+                      <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5 truncate">
+                        <span className="flex items-center gap-1 font-mono shrink-0">
                           <Clock className="w-3 h-3" />
                           {item.duration.toFixed(1)}s
                         </span>
                         <span>•</span>
-                        <span className="uppercase font-mono">{item.format}</span>
+                        <span className="uppercase font-mono shrink-0">{item.format}</span>
                         {item.latestScore !== null && (
                           <>
                             <span>•</span>
-                            <span className="text-cyan-400 font-mono font-semibold">
+                            <span className="text-cyan-400 font-mono font-semibold shrink-0">
                               {item.latestScore}%
                             </span>
                           </>
