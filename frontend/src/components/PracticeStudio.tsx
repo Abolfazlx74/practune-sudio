@@ -12,6 +12,8 @@ import {
   ChevronRight,
   Clock,
   Repeat,
+  History,
+  Timer,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
@@ -39,7 +41,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
 
-  // New: Practice Mode (Full Song vs Note-by-Note)
+  // Pre-Practice Countdown Timer (Enabled by default, 3s default, customizable)
+  const [countdownEnabled, setCountdownEnabled] = useState<boolean>(true);
+  const [countdownDuration, setCountdownDuration] = useState<number>(3);
+  const [countdownValue, setCountdownValue] = useState<number | null>(null);
+  const countdownIntervalRef = useRef<number | null>(null);
+
+  // Practice Mode (Full Song vs Note-by-Note)
   const [practiceMode, setPracticeMode] = useState<'full' | 'note'>('full');
   const [selectedNoteIndex, setSelectedNoteIndex] = useState<number>(0);
   const [loopNote, setLoopNote] = useState<boolean>(true);
@@ -65,6 +73,16 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     setIsMuted((prev) => !prev);
   };
 
+  // Customizable Speed Handler
+  const handleSpeedChange = (speed: number) => {
+    const clamped = Math.max(0.25, Math.min(2.0, Math.round(speed * 100) / 100));
+    setPlaybackSpeed(clamped);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = clamped;
+      audioRef.current.preservesPitch = true;
+    }
+  };
+
   // Transpose notes for practice if user changes key
   const effectiveNotes: NoteItem[] = transcription.notes.map((n) => {
     const newMidi = n.midi + transposeSemitones;
@@ -77,17 +95,90 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const duration = transcription.duration || 10;
   const selectedNote: NoteItem | undefined = effectiveNotes[selectedNoteIndex];
 
-  // Stop mic on unmount
+  // Stop mic and countdown on unmount
   useEffect(() => {
     return () => {
       if (trackerRef.current) {
         trackerRef.current.stop();
       }
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+      }
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
   }, []);
 
-  const startPracticeSession = async () => {
+  // Cancel countdown if Escape key is pressed
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && countdownValue !== null) {
+        cancelCountdown();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [countdownValue]);
+
+  // Audio beep generator for studio countdown lead-in
+  const playCountdownBeep = (isFinal: boolean) => {
+    try {
+      if (isFinal) {
+        synth.playTone(1760, 0.22, 0.5); // High crisp beep for GO!
+      } else {
+        synth.playTone(880, 0.1, 0.35); // Lead-in beep for 3, 2, 1
+      }
+    } catch {
+      // Audio context error ignore
+    }
+  };
+
+  const cancelCountdown = () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdownValue(null);
+  };
+
+  // Pre-Practice trigger with countdown logic
+  const handleStartPracticeClick = () => {
+    if (isPracticing) return;
+
+    if (!countdownEnabled || countdownDuration <= 0) {
+      executeStartPractice();
+      return;
+    }
+
+    // Start countdown
+    cancelCountdown();
+    let currentCount = countdownDuration;
+    setCountdownValue(currentCount);
+    playCountdownBeep(false);
+
+    countdownIntervalRef.current = window.setInterval(() => {
+      currentCount -= 1;
+      if (currentCount > 0) {
+        setCountdownValue(currentCount);
+        playCountdownBeep(false);
+      } else {
+        // Countdown reached 0
+        if (countdownIntervalRef.current) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+        }
+        setCountdownValue(0);
+        playCountdownBeep(true);
+
+        setTimeout(() => {
+          setCountdownValue(null);
+          executeStartPractice();
+        }, 320);
+      }
+    }, 1000);
+  };
+
+  // Actual execution of practice session
+  const executeStartPractice = async () => {
     try {
       userPitchHistory.current = [];
       const tracker = new MicPitchTracker();
@@ -130,6 +221,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   };
 
   const stopPracticeSession = async () => {
+    cancelCountdown();
     if (trackerRef.current) {
       trackerRef.current.stop();
     }
@@ -449,8 +541,20 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             </div>
           </div>
 
-          {/* Action Buttons: Timeline Clock + Mute Toggle + Start / Stop Practice */}
+          {/* Action Buttons: History + Timeline Clock + Mute Toggle + Start / Stop Practice */}
           <div className="flex items-center gap-2.5">
+            {/* Practice History Button (Positioned left of the clock, reserved for next prompt) */}
+            <button
+              onClick={() => {
+                // Reserved for next prompt implementation
+              }}
+              className="p-2.5 rounded-xl border border-slate-800 bg-slate-950/90 text-slate-400 hover:text-cyan-300 hover:border-slate-700 shadow-sm transition-all flex items-center justify-center"
+              title="Practice History"
+              aria-label="Practice History"
+            >
+              <History className="w-4 h-4" />
+            </button>
+
             {/* Live Digital Timeline Seconds Readout */}
             <div className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 font-mono text-xs shadow-inner">
               <Clock className="w-3.5 h-3.5 text-cyan-400" />
@@ -477,14 +581,25 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
             </button>
 
+            {/* Start / Finish Action Button */}
             {!isPracticing ? (
-              <button
-                onClick={startPracticeSession}
-                className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
-              >
-                <Play className="w-4 h-4 fill-current ml-0.5" />
-                {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
-              </button>
+              countdownValue !== null ? (
+                <button
+                  onClick={cancelCountdown}
+                  className="flex items-center gap-2 px-5 py-2.5 bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-amber-600/25 transition-all animate-pulse"
+                >
+                  <Timer className="w-4 h-4" />
+                  Starting in {countdownValue}s... (Cancel)
+                </button>
+              ) : (
+                <button
+                  onClick={handleStartPracticeClick}
+                  className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
+                >
+                  <Play className="w-4 h-4 fill-current ml-0.5" />
+                  {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
+                </button>
+              )
             ) : (
               <button
                 onClick={stopPracticeSession}
@@ -503,6 +618,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             <button
               onClick={() => {
                 if (isPracticing) stopPracticeSession();
+                cancelCountdown();
                 setPracticeMode('full');
               }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
@@ -517,6 +633,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             <button
               onClick={() => {
                 if (isPracticing) stopPracticeSession();
+                cancelCountdown();
                 setPracticeMode('note');
               }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
@@ -694,32 +811,102 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           </div>
         </div>
 
-        {/* Practice Speed & Transpose Bar */}
+        {/* Practice Toolbar: Customizable Speed, Pre-Practice Countdown & Key Shift */}
         <div className="flex flex-wrap items-center justify-between gap-4 mt-4 pt-3 border-t border-slate-800/80">
-          {/* Slow Playback */}
-          <div className="flex items-center gap-2">
+          {/* Customizable Playback Speed */}
+          <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-slate-400 font-semibold">Speed:</span>
-            <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 p-1 rounded-xl">
-              {[0.5, 0.75, 1.0].map((rate) => (
+            <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 px-2 py-1 rounded-xl">
+              <button
+                onClick={() => handleSpeedChange(playbackSpeed - 0.05)}
+                disabled={playbackSpeed <= 0.25}
+                className="w-5 h-5 flex items-center justify-center rounded bg-slate-900 hover:bg-slate-800 text-slate-300 disabled:opacity-30 text-xs font-bold transition-colors"
+                title="Decrease speed by 5%"
+              >
+                -
+              </button>
+
+              <input
+                type="range"
+                min="0.25"
+                max="2.0"
+                step="0.05"
+                value={playbackSpeed}
+                onChange={(e) => handleSpeedChange(parseFloat(e.target.value))}
+                className="w-20 md:w-24 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                title={`Playback Speed: ${Math.round(playbackSpeed * 100)}%`}
+              />
+
+              <button
+                onClick={() => handleSpeedChange(playbackSpeed + 0.05)}
+                disabled={playbackSpeed >= 2.0}
+                className="w-5 h-5 flex items-center justify-center rounded bg-slate-900 hover:bg-slate-800 text-slate-300 disabled:opacity-30 text-xs font-bold transition-colors"
+                title="Increase speed by 5%"
+              >
+                +
+              </button>
+
+              <span className="text-xs font-mono font-bold text-cyan-400 min-w-10 text-center select-none">
+                {Math.round(playbackSpeed * 100)}%
+              </span>
+            </div>
+
+            {/* Quick Presets */}
+            <div className="hidden sm:flex items-center gap-1 bg-slate-950/70 border border-slate-800/80 p-1 rounded-xl">
+              {[0.5, 0.75, 1.0, 1.25].map((rate) => (
                 <button
                   key={rate}
-                  onClick={() => {
-                    setPlaybackSpeed(rate);
-                    if (audioRef.current) {
-                      audioRef.current.playbackRate = rate;
-                      audioRef.current.preservesPitch = true;
-                    }
-                  }}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${
+                  onClick={() => handleSpeedChange(rate)}
+                  className={`px-2 py-0.5 rounded-lg text-[11px] font-semibold transition-all ${
                     playbackSpeed === rate
                       ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300'
-                      : 'text-slate-400 hover:text-slate-200'
+                      : 'text-slate-500 hover:text-slate-300'
                   }`}
                 >
-                  {rate * 100}%
+                  {Math.round(rate * 100)}%
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* Pre-Practice Countdown Setting (Toggleable, default 3s, customizable) */}
+          <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 p-1 rounded-xl">
+            <button
+              onClick={() => setCountdownEnabled((prev) => !prev)}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${
+                countdownEnabled
+                  ? 'bg-cyan-950 border border-cyan-800/60 text-cyan-300'
+                  : 'text-slate-500 hover:text-slate-300'
+              }`}
+              title={countdownEnabled ? "Disable pre-practice countdown" : "Enable pre-practice countdown"}
+            >
+              <Timer className="w-3.5 h-3.5" />
+              <span>Lead-in: {countdownEnabled ? `${countdownDuration}s` : 'Off'}</span>
+            </button>
+
+            {countdownEnabled && (
+              <div className="flex items-center gap-1 px-1 border-l border-slate-800">
+                <button
+                  onClick={() => setCountdownDuration((d) => Math.max(1, d - 1))}
+                  disabled={countdownDuration <= 1}
+                  className="w-5 h-5 flex items-center justify-center rounded bg-slate-900 hover:bg-slate-800 text-slate-300 disabled:opacity-30 text-xs font-bold transition-colors"
+                  title="Decrease countdown (-1s)"
+                >
+                  -
+                </button>
+                <span className="text-xs font-mono font-bold text-cyan-400 min-w-6 text-center select-none">
+                  {countdownDuration}s
+                </span>
+                <button
+                  onClick={() => setCountdownDuration((d) => Math.min(10, d + 1))}
+                  disabled={countdownDuration >= 10}
+                  className="w-5 h-5 flex items-center justify-center rounded bg-slate-900 hover:bg-slate-800 text-slate-300 disabled:opacity-30 text-xs font-bold transition-colors"
+                  title="Increase countdown (+1s)"
+                >
+                  +
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Transposition */}
@@ -745,15 +932,11 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               </button>
             </div>
           </div>
-
-          <div className="text-xs text-slate-500">
-            Green line = In Pitch • Amber line = Drift/Variance
-          </div>
         </div>
       </div>
 
-      {/* Dual Layer Real-time Pitch Canvas */}
-      <div className="daw-panel p-4 border border-slate-800 bg-slate-900/50 rounded-2xl space-y-2">
+      {/* Dual Layer Real-time Pitch Canvas Container */}
+      <div className="daw-panel p-4 border border-slate-800 bg-slate-900/50 rounded-2xl space-y-2 relative">
         <div className="flex items-center justify-between text-xs text-slate-400 px-1">
           <span className="flex items-center gap-1.5 text-cyan-300">
             <span className="w-3 h-2 bg-cyan-500/30 border border-cyan-400 rounded-xs"></span>
@@ -772,6 +955,28 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             className="w-full h-80 block cursor-pointer"
             title="Click any note to select and practice it"
           />
+
+          {/* Studio Countdown HUD Overlay */}
+          {countdownValue !== null && (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-slate-950/85 backdrop-blur-md rounded-xl animate-fade-in select-none">
+              <div className="flex flex-col items-center gap-3">
+                <div className="text-8xl font-black font-mono tracking-tight text-transparent bg-clip-text bg-gradient-to-br from-cyan-300 via-teal-300 to-emerald-400 drop-shadow-[0_0_35px_rgba(6,182,212,0.7)] animate-pulse">
+                  {countdownValue > 0 ? countdownValue : 'SING!'}
+                </div>
+                <p className="text-sm font-semibold tracking-wider text-slate-300 uppercase">
+                  {practiceMode === 'note' && selectedNote
+                    ? `Get Ready for Note: ${selectedNote.note_name}`
+                    : 'Get ready to sing with the track...'}
+                </p>
+                <button
+                  onClick={cancelCountdown}
+                  className="mt-3 px-4 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-xs font-semibold text-slate-400 hover:text-white transition-all shadow-md"
+                >
+                  Cancel Countdown (Esc)
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -782,7 +987,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           onClose={() => setEvaluation(null)}
           onRetry={() => {
             setEvaluation(null);
-            startPracticeSession();
+            handleStartPracticeClick();
           }}
         />
       )}
