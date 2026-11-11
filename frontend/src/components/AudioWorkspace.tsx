@@ -18,6 +18,7 @@ import {
   X,
   ZoomIn,
   ZoomOut,
+  Save,
 } from 'lucide-react';
 import type { AudioInfo, PreprocessOptions } from '../types';
 import {
@@ -27,6 +28,7 @@ import {
   uploadAudio,
   trimAudio,
 } from '../services/api';
+import { generateAssetId, storeAudioBlob } from '../services/projectService';
 
 interface AudioWorkspaceProps {
   audioInfo: AudioInfo | null;
@@ -34,6 +36,10 @@ interface AudioWorkspaceProps {
   onTranscriptionComplete: (data: any) => void;
   isTranscribing: boolean;
   setIsTranscribing: (val: boolean) => void;
+  isDirty?: boolean;
+  onRequestImportWithCheck?: (importFn: () => Promise<void>) => void;
+  onWorkspaceModified?: () => void;
+  onSaveProject?: () => void;
 }
 
 export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
@@ -42,6 +48,10 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
   onTranscriptionComplete,
   isTranscribing,
   setIsTranscribing,
+  isDirty = false,
+  onRequestImportWithCheck,
+  onWorkspaceModified,
+  onSaveProject,
 }) => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -384,6 +394,7 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
       onAudioSelected(trimmed);
       setProcessedAudio(trimmed);
       setActiveVersion('processed');
+      onWorkspaceModified?.();
       setTrimNotice(`Track trimmed successfully to ${cutStart.toFixed(2)}s - ${cutEnd.toFixed(2)}s (${trimmed.duration.toFixed(2)}s)`);
       setCutStep('idle');
       setCutStart(null);
@@ -430,18 +441,28 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     }
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     const file = files[0];
 
-    try {
-      const info = await uploadAudio(file);
-      onAudioSelected(info);
-      setProcessedAudio(null);
-      setActiveVersion('original');
-    } catch (err: any) {
-      alert(`Upload error: ${err.message}`);
+    const doUpload = async () => {
+      try {
+        const info = await uploadAudio(file);
+        const assetId = generateAssetId(file.name, file.size);
+        await storeAudioBlob(assetId, file, { filename: file.name, mimeType: file.type || 'audio/wav' });
+        onAudioSelected(info);
+        setProcessedAudio(null);
+        setActiveVersion('original');
+      } catch (err: any) {
+        alert(`Upload error: ${err.message}`);
+      }
+    };
+
+    if (isDirty && onRequestImportWithCheck) {
+      onRequestImportWithCheck(doUpload);
+    } else {
+      doUpload();
     }
   };
 
@@ -459,6 +480,7 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
       const result = await preprocessAudio(audioInfo.id, opts);
       setProcessedAudio(result);
       setActiveVersion('processed');
+      onWorkspaceModified?.();
     } catch (err: any) {
       alert(`Processing error: ${err.message}`);
     } finally {
@@ -601,6 +623,18 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
                   Processed Track
                 </button>
               </div>
+            )}
+
+            {/* Save Project Button */}
+            {activeAudio && onSaveProject && (
+              <button
+                onClick={onSaveProject}
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-800/80 hover:bg-slate-800 text-slate-200 hover:text-white border border-slate-700/60 rounded-xl text-xs font-semibold transition-all shadow-sm cursor-pointer"
+                title={isDirty ? 'Save Workspace to Project' : 'Project Saved'}
+              >
+                <Save className={`w-3.5 h-3.5 ${isDirty ? 'text-cyan-400' : 'text-slate-400'}`} />
+                <span>Save Project</span>
+              </button>
             )}
 
             {/* Upload Button */}

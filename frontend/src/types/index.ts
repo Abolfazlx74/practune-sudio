@@ -119,3 +119,40 @@ export interface HistoryTrack {
   last_practiced_at: string;
   configurations: PracticeConfiguration[];
 }
+
+export interface WorkspaceSettings {
+  playbackRate?: number;
+  rangeStart?: number;
+  rangeEnd?: number;
+  noiseReduction?: boolean;
+  noiseIntensity?: number;
+  normalize?: boolean;
+  activeVersion?: 'original' | 'processed';
+}
+
+export interface AudioAsset {
+  assetId: string;
+  filename: string;
+  original_filename: string;
+  format: string;
+  duration: number;
+  sample_rate: number;
+  channels: number;
+  file_size: number;
+  created_at: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  assetId: string;
+  audioInfo: AudioInfo;
+  transcription: TranscriptionResult | null;
+  workspaceSettings?: WorkspaceSettings;
+  practiceSettings?: PracticeConfigSettings;
+  configurations: PracticeConfiguration[];
+  createdAt: string;
+  updatedAt: string;
+  lastOpenedAt: string;
+}
+

@@ -15,12 +15,13 @@ import {
   History,
   Timer,
 } from 'lucide-react';
-import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings } from '../types';
+import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
 import type { LivePitchData } from '../services/micPitchTracker';
 import { getAudioFileUrl, evaluatePractice } from '../services/api';
 import { synth } from '../services/synth';
 import { recordPracticeSession } from '../services/historyService';
+import { recordPerformanceToProject } from '../services/projectService';
 import { EvaluationModal } from './EvaluationModal';
 import { SmartHistoryModal } from './SmartHistoryModal';
 
@@ -28,18 +29,24 @@ interface PracticeStudioProps {
   transcription: TranscriptionResult;
   audioId: string;
   audioInfo?: AudioInfo | null;
+  currentProjectId?: string | null;
   onRestoreTrack?: (
     audio: AudioInfo,
     transcription: TranscriptionResult,
     settings: PracticeConfigSettings
   ) => void;
+  onOpenProject?: (project: Project) => void;
+  onPracticeModified?: () => void;
 }
 
 export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   transcription,
   audioId,
   audioInfo,
+  currentProjectId,
   onRestoreTrack,
+  onOpenProject,
+  onPracticeModified,
 }) => {
   // Practice session states
   const [isPracticing, setIsPracticing] = useState(false);
@@ -252,7 +259,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         const resp = await evaluatePractice(evalTargetNotes, userPitchHistory.current, 50.0);
         setEvaluation(resp);
 
-        // Record session into Smart Performance History
+        // Record session into Smart Performance History and Project Service
         const currentSettings: PracticeConfigSettings = {
           mode: practiceMode,
           target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
@@ -262,15 +269,20 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           tolerance_cents: 50.0,
         };
 
-        recordPracticeSession(
-          audioInfo || {
-            id: audioId,
-            filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
-            duration: duration,
-          },
+        const sessionAudio = audioInfo || {
+          id: audioId,
+          filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
+          duration: duration,
+        };
+
+        recordPracticeSession(sessionAudio, currentSettings, resp);
+        await recordPerformanceToProject(
+          currentProjectId || audioId,
+          sessionAudio,
           currentSettings,
           resp
         );
+        onPracticeModified?.();
       } catch (err: any) {
         console.error('Evaluation error:', err);
       } finally {
@@ -1025,7 +1037,25 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       {isHistoryOpen && (
         <SmartHistoryModal
           currentAudioId={audioId}
+          currentProjectId={currentProjectId}
           onClose={() => setIsHistoryOpen(false)}
+          onOpenProject={(proj) => {
+            setIsHistoryOpen(false);
+            if (onOpenProject) {
+              onOpenProject(proj);
+            } else if (onRestoreTrack && proj.transcription) {
+              onRestoreTrack(
+                proj.audioInfo,
+                proj.transcription,
+                proj.practiceSettings || {
+                  mode: 'full',
+                  playback_speed: 1.0,
+                  transpose_semitones: 0,
+                  tolerance_cents: 50.0,
+                }
+              );
+            }
+          }}
           onApplySettingsOnly={(settings) => {
             setPlaybackSpeed(settings.playback_speed);
             if (audioRef.current) {

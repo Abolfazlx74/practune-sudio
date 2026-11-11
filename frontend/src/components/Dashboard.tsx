@@ -7,36 +7,54 @@ import {
   ArrowRight,
   FolderOpen,
   FileAudio,
-  Play,
+  ChevronRight,
 } from 'lucide-react';
-import type { AudioInfo } from '../types';
+import type { AudioInfo, Project } from '../types';
 import { listRecentAudios, uploadAudio } from '../services/api';
+import {
+  getAllProjects,
+  generateAssetId,
+  storeAudioBlob,
+} from '../services/projectService';
 
 interface DashboardProps {
-  onSelectAudio: (audio: AudioInfo) => void;
+  onSelectAudio: (audio: AudioInfo, file?: File) => void;
+  onOpenProject: (project: Project) => void;
+  onOpenHistory: () => void;
   onNavigateToWorkspace: () => void;
+  isDirty?: boolean;
+  onRequestImportWithCheck?: (importFn: () => Promise<void>) => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
   onSelectAudio,
+  onOpenProject,
+  onOpenHistory,
   onNavigateToWorkspace,
+  isDirty = false,
+  onRequestImportWithCheck,
 }) => {
+  const [projects, setProjects] = useState<Project[]>([]);
   const [recentAudios, setRecentAudios] = useState<AudioInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
 
   useEffect(() => {
-    async function fetchAudios() {
+    async function loadData() {
       try {
-        const list = await listRecentAudios();
-        setRecentAudios(list);
+        const [savedProjects, audios] = await Promise.all([
+          getAllProjects(),
+          listRecentAudios().catch(() => []),
+        ]);
+        setProjects(savedProjects);
+        setRecentAudios(audios);
       } catch (err) {
-        console.error('Failed to load recent audios:', err);
+        console.error('Failed to load dashboard data:', err);
       } finally {
         setIsLoading(false);
       }
     }
-    fetchAudios();
+    loadData();
   }, []);
 
   const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
@@ -44,58 +62,106 @@ export const Dashboard: React.FC<DashboardProps> = ({
     setIsDragging(false);
     const files = e.dataTransfer.files;
     if (files && files.length > 0) {
-      await handleFile(files[0]);
+      triggerAudioImport(files[0]);
     }
   };
 
   const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files && files.length > 0) {
-      await handleFile(files[0]);
+      triggerAudioImport(files[0]);
     }
   };
 
-  const handleFile = async (file: File) => {
-    try {
-      const info = await uploadAudio(file);
-      onSelectAudio(info);
-      onNavigateToWorkspace();
-    } catch (err: any) {
-      alert(`Upload error: ${err.message}`);
+  const triggerAudioImport = (file: File) => {
+    const doImport = async () => {
+      try {
+        const info = await uploadAudio(file);
+        const assetId = generateAssetId(file.name, file.size);
+        await storeAudioBlob(assetId, file, {
+          filename: file.name,
+          mimeType: file.type || 'audio/wav',
+        });
+        onSelectAudio(info, file);
+        onNavigateToWorkspace();
+      } catch (err: any) {
+        alert(`Upload error: ${err.message}`);
+      }
+    };
+
+    if (isDirty && onRequestImportWithCheck) {
+      onRequestImportWithCheck(doImport);
+    } else {
+      doImport();
     }
   };
 
   // Demo audio synthesizer generator for instant testing
-  const handleLoadDemo = async () => {
-    // Generate a simple synthetic vocal arpeggio WAV in-browser and upload it!
-    const sampleRate = 22050;
-    const notes = [60, 64, 67, 72, 67, 64, 60]; // C4, E4, G4, C5, G4, E4, C4
-    const noteDuration = 0.45;
-    const totalSamples = Math.floor(sampleRate * notes.length * noteDuration);
-    const buffer = new Float32Array(totalSamples);
+  const handleLoadDemo = () => {
+    const doLoadDemo = async () => {
+      const sampleRate = 22050;
+      const notes = [60, 64, 67, 72, 67, 64, 60]; // C4, E4, G4, C5, G4, E4, C4
+      const noteDuration = 0.45;
+      const totalSamples = Math.floor(sampleRate * notes.length * noteDuration);
+      const buffer = new Float32Array(totalSamples);
 
-    notes.forEach((midi, idx) => {
-      const freq = 440 * Math.pow(2, (midi - 69) / 12);
-      const startSample = Math.floor(idx * noteDuration * sampleRate);
-      const endSample = startSample + Math.floor(noteDuration * sampleRate);
-      for (let s = startSample; s < endSample; s++) {
-        const t = (s - startSample) / sampleRate;
-        // Warm vocal-like formant: fundamental + 2nd harmonic + vibrato
-        const vibrato = 2.5 * Math.sin(2 * Math.PI * 5 * t);
-        const val =
-          0.6 * Math.sin(2 * Math.PI * (freq + vibrato) * t) +
-          0.3 * Math.sin(2 * Math.PI * (freq * 2) * t);
-        // Envelope
-        const env = Math.sin((Math.PI * (s - startSample)) / (endSample - startSample));
-        buffer[s] = val * env;
-      }
-    });
+      notes.forEach((midi, idx) => {
+        const freq = 440 * Math.pow(2, (midi - 69) / 12);
+        const startSample = Math.floor(idx * noteDuration * sampleRate);
+        const endSample = startSample + Math.floor(noteDuration * sampleRate);
+        for (let s = startSample; s < endSample; s++) {
+          const t = (s - startSample) / sampleRate;
+          const vibrato = 2.5 * Math.sin(2 * Math.PI * 5 * t);
+          const val =
+            0.6 * Math.sin(2 * Math.PI * (freq + vibrato) * t) +
+            0.3 * Math.sin(2 * Math.PI * (freq * 2) * t);
+          const env = Math.sin((Math.PI * (s - startSample)) / (endSample - startSample));
+          buffer[s] = val * env;
+        }
+      });
 
-    // Create 16-bit PCM WAV Blob
-    const wavBytes = encodeWAV(buffer, sampleRate);
-    const file = new File([wavBytes], 'vocal_arpeggio_demo.wav', { type: 'audio/wav' });
-    await handleFile(file);
+      const wavBytes = encodeWAV(buffer, sampleRate);
+      const file = new File([wavBytes], 'vocal_arpeggio_demo.wav', { type: 'audio/wav' });
+      const info = await uploadAudio(file);
+      const assetId = generateAssetId(file.name, file.size);
+      await storeAudioBlob(assetId, file, { filename: file.name, mimeType: 'audio/wav' });
+      onSelectAudio(info, file);
+      onNavigateToWorkspace();
+    };
+
+    if (isDirty && onRequestImportWithCheck) {
+      onRequestImportWithCheck(doLoadDemo);
+    } else {
+      doLoadDemo();
+    }
   };
+
+  // Build top 3 items for display (Projects prioritized, fallback to raw audios)
+  const displayItems =
+    projects.length > 0
+      ? projects.slice(0, 3).map((p) => ({
+          id: p.id,
+          name: p.name,
+          duration: p.audioInfo.duration,
+          format: p.audioInfo.format,
+          latestScore:
+            p.configurations && p.configurations.length > 0
+              ? p.configurations[0].latest_score
+              : null,
+          isProject: true,
+          project: p,
+        }))
+      : recentAudios.slice(0, 3).map((a) => ({
+          id: a.id,
+          name: a.original_filename,
+          duration: a.duration,
+          format: a.format,
+          latestScore: null,
+          isProject: false,
+          audio: a,
+        }));
+
+  const totalCount = projects.length > 0 ? projects.length : recentAudios.length;
 
   return (
     <div className="space-y-8 max-w-6xl mx-auto py-2">
@@ -160,53 +226,77 @@ export const Dashboard: React.FC<DashboardProps> = ({
         </div>
       </div>
 
-      {/* Recent Projects & Uploads */}
+      {/* Recent Projects & Uploads (Preserves section design, max 3, More action, overflow fix) */}
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <FolderOpen className="w-4 h-4 text-cyan-400" />
             <h2 className="text-base font-semibold text-slate-200">Recent Studio Sessions</h2>
           </div>
-          <span className="text-xs text-slate-400 font-mono">{recentAudios.length} tracks</span>
+
+          <button
+            onClick={onOpenHistory}
+            className="text-xs text-slate-400 hover:text-cyan-400 font-mono transition-colors flex items-center gap-1 cursor-pointer bg-transparent border-0"
+            title="Open complete project library in History"
+          >
+            <span>More</span>
+            <span>({totalCount})</span>
+            <ChevronRight className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         {isLoading ? (
           <div className="p-8 text-center text-xs text-slate-500">Loading sessions...</div>
-        ) : recentAudios.length === 0 ? (
+        ) : displayItems.length === 0 ? (
           <div className="p-8 rounded-2xl bg-slate-900/30 border border-slate-800/80 text-center text-slate-400 text-xs">
             No audio sessions found. Upload a track or click "Load Vocal Arpeggio Demo" above!
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {recentAudios.map((audio) => (
+            {displayItems.map((item: any) => (
               <div
-                key={audio.id}
+                key={item.id}
                 onClick={() => {
-                  onSelectAudio(audio);
-                  onNavigateToWorkspace();
+                  if (item.isProject && item.project) {
+                    onOpenProject(item.project);
+                  } else if (item.audio) {
+                    onSelectAudio(item.audio);
+                    onNavigateToWorkspace();
+                  }
                 }}
-                className="daw-panel p-4 border border-slate-800/80 bg-slate-900/40 hover:bg-slate-900/80 hover:border-cyan-800/60 rounded-2xl cursor-pointer transition-all group shadow-sm"
+                className="daw-panel p-4 border border-slate-800/80 bg-slate-900/40 hover:bg-slate-900/80 hover:border-cyan-800/60 rounded-2xl cursor-pointer transition-all group shadow-sm overflow-hidden"
               >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-3">
-                    <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-cyan-400 group-hover:bg-cyan-950 transition-colors">
+                <div className="flex items-start justify-between gap-2 min-w-0">
+                  <div className="flex items-center gap-3 min-w-0 flex-1 overflow-hidden">
+                    <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-cyan-400 group-hover:bg-cyan-950 transition-colors shrink-0">
                       <FileAudio className="w-4 h-4" />
                     </div>
-                    <div>
-                      <h3 className="text-xs font-semibold text-slate-200 group-hover:text-cyan-300 transition-colors truncate max-w-[180px]">
-                        {audio.original_filename}
+                    <div className="min-w-0 flex-1 overflow-hidden">
+                      <h3
+                        className="text-xs font-semibold text-slate-200 group-hover:text-cyan-300 transition-colors truncate block w-full text-ellipsis overflow-hidden"
+                        title={item.name}
+                      >
+                        {item.name}
                       </h3>
                       <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5">
                         <span className="flex items-center gap-1 font-mono">
                           <Clock className="w-3 h-3" />
-                          {audio.duration.toFixed(1)}s
+                          {item.duration.toFixed(1)}s
                         </span>
                         <span>•</span>
-                        <span className="uppercase font-mono">{audio.format}</span>
+                        <span className="uppercase font-mono">{item.format}</span>
+                        {item.latestScore !== null && (
+                          <>
+                            <span>•</span>
+                            <span className="text-cyan-400 font-mono font-semibold">
+                              {item.latestScore}%
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
-                  <ArrowRight className="w-4 h-4 text-slate-600 group-hover:text-cyan-400 group-hover:translate-x-0.5 transition-all" />
+                  <ArrowRight className="w-4 h-4 text-slate-600 group-hover:text-cyan-400 group-hover:translate-x-0.5 transition-all shrink-0" />
                 </div>
               </div>
             ))}
