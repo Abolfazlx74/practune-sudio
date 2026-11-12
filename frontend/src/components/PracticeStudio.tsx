@@ -14,6 +14,10 @@ import {
   Repeat,
   History,
   Timer,
+  Eye,
+  EyeOff,
+  Mic2,
+  Piano,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
@@ -59,6 +63,11 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [isEvaluating, setIsEvaluating] = useState(false);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
+  // Studio Domain Mode (Vocal vs Instrument) & Blind Memory Mode
+  const [studioType, setStudioType] = useState<'vocal' | 'instrument'>('vocal');
+  const [blindMode, setBlindMode] = useState<boolean>(false);
+  const [showPostBlindAnalysis, setShowPostBlindAnalysis] = useState<boolean>(false);
+
   // Pre-Practice Countdown Timer (Enabled by default, 3s default, customizable)
   const [countdownEnabled, setCountdownEnabled] = useState<boolean>(true);
   const [countdownDuration, setCountdownDuration] = useState<number>(3);
@@ -78,6 +87,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const trackerRef = useRef<MicPitchTracker | null>(null);
   const userPitchHistory = useRef<PitchFrame[]>([]);
+  const livePitchRef = useRef<LivePitchData | null>(null);
+  const recentMicMidisRef = useRef<number[]>([]);
+  const smoothedMidiRef = useRef<number | null>(null);
   const animRef = useRef<number | null>(null);
 
   // Sync mute state with reference audio element
@@ -110,6 +122,144 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     return { ...n, midi: newMidi, note_name: name };
   });
 
+  // De-spiked & Smoothed Continuous F0 Contour (9-point Median Filter + Gaussian Smooth)
+  const rawContour: PitchFrame[] = React.useMemo(() => {
+    const source: PitchFrame[] =
+      (transcription as any).pitch_contour || (transcription as any).f0_contour || [];
+    if (source.length === 0) return [];
+
+    // Step 1: 9-point Median Filter to strip harmonic spikes & background noise glitches
+    const despiked: PitchFrame[] = source.map((curr, idx) => {
+      if (curr.midi <= 0 || (curr.confidence !== undefined && curr.confidence < 0.25)) {
+        return { ...curr, midi: 0 };
+      }
+      const windowVals: number[] = [];
+      for (let k = Math.max(0, idx - 4); k <= Math.min(source.length - 1, idx + 4); k++) {
+        const neighbor = source[k];
+        if (
+          neighbor.midi > 0 &&
+          (neighbor.confidence === undefined || neighbor.confidence >= 0.25) &&
+          Math.abs(neighbor.time - curr.time) <= 0.22
+        ) {
+          windowVals.push(neighbor.midi);
+        }
+      }
+      if (windowVals.length < 3) {
+        return { ...curr, midi: 0 };
+      }
+      windowVals.sort((a, b) => a - b);
+      const medianMidi = windowVals[Math.floor(windowVals.length / 2)];
+      return { ...curr, midi: medianMidi };
+    });
+
+    // Step 2: Weighted Gaussian smoothing over voiced segments
+    const smoothed: PitchFrame[] = [];
+    const weights = [0.08, 0.14, 0.22, 0.28, 0.22, 0.14, 0.08];
+    for (let i = 0; i < despiked.length; i++) {
+      const curr = despiked[i];
+      if (curr.midi <= 0) {
+        smoothed.push({ ...curr, midi: 0 });
+        continue;
+      }
+      let wSum = 0;
+      let valSum = 0;
+      for (let offset = -3; offset <= 3; offset++) {
+        const j = i + offset;
+        if (j >= 0 && j < despiked.length && despiked[j].midi > 0) {
+          const dt = Math.abs(despiked[j].time - curr.time);
+          const dm = Math.abs(despiked[j].midi - curr.midi);
+          if (dt <= 0.16 && dm <= 4.5) {
+            const w = weights[offset + 3];
+            valSum += despiked[j].midi * w;
+            wSum += w;
+          }
+        }
+      }
+      smoothed.push({
+        ...curr,
+        midi: (wSum > 0 ? valSum / wSum : curr.midi) + transposeSemitones,
+      });
+    }
+    return smoothed;
+  }, [transcription, transposeSemitones]);
+
+  // Helper to get reference MIDI at any timestamp
+  const getTargetMidiAtTime = (t: number): number | null => {
+    if (studioType === 'vocal' && rawContour.length > 0) {
+      let lo = 0;
+      let hi = rawContour.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (rawContour[mid].time < t) lo = mid + 1;
+        else hi = mid;
+      }
+      const p2 = rawContour[lo];
+      const p1 = lo > 0 ? rawContour[lo - 1] : p2;
+
+      if (p1 && p2 && p1.midi > 0 && p2.midi > 0 && p2.time - p1.time <= 0.15 && p2.time > p1.time) {
+        const ratio = Math.max(0, Math.min(1, (t - p1.time) / (p2.time - p1.time)));
+        return p1.midi + (p2.midi - p1.midi) * ratio;
+      }
+      if (p2 && p2.midi > 0 && Math.abs(p2.time - t) <= 0.12) {
+        return p2.midi;
+      }
+      return null;
+    }
+    const refNote = practiceMode === 'note' && selectedNote
+      ? selectedNote
+      : effectiveNotes.find((n) => t >= n.start && t <= n.end);
+    return refNote ? refNote.midi : null;
+  };
+
+  // Check if a sung MIDI matches the reference contour within a ±0.20s window
+  const isUserPitchMatchedWithWindow = (t: number, userMidi: number): boolean => {
+    if (studioType === 'vocal' && rawContour.length > 0) {
+      let hasVoicedRefNearby = false;
+      for (let i = 0; i < rawContour.length; i++) {
+        const pt = rawContour[i];
+        if (pt.time < t - 0.20) continue;
+        if (pt.time > t + 0.20) break;
+        if (pt.midi > 0) {
+          hasVoicedRefNearby = true;
+          if (Math.abs(userMidi - pt.midi) <= 0.85) {
+            return true;
+          }
+        }
+      }
+      if (!hasVoicedRefNearby) return true;
+      return false;
+    }
+    const targetMidi = getTargetMidiAtTime(t);
+    return targetMidi !== null && Math.abs(userMidi - targetMidi) <= 0.65;
+  };
+
+  // Multi-stage Mic Stabilizer: Median Despike + Octave Lock + Smooth EMA
+  const stabilizeUserMidi = (rawMidi: number, timestamp: number): number => {
+    let corrected = rawMidi;
+    const refMidi = getTargetMidiAtTime(timestamp);
+
+    if (refMidi !== null) {
+      if (Math.abs((corrected - 12) - refMidi) <= 1.6) corrected -= 12;
+      else if (Math.abs((corrected + 12) - refMidi) <= 1.6) corrected += 12;
+    } else if (smoothedMidiRef.current !== null) {
+      if (Math.abs((corrected - 12) - smoothedMidiRef.current) <= 1.6) corrected -= 12;
+      else if (Math.abs((corrected + 12) - smoothedMidiRef.current) <= 1.6) corrected += 12;
+    }
+
+    const buf = recentMicMidisRef.current;
+    buf.push(corrected);
+    if (buf.length > 5) buf.shift();
+    const sorted = [...buf].sort((a, b) => a - b);
+    const medianMidi = sorted[Math.floor(sorted.length / 2)];
+
+    if (smoothedMidiRef.current === null || Math.abs(medianMidi - smoothedMidiRef.current) > 6) {
+      smoothedMidiRef.current = medianMidi;
+    } else {
+      smoothedMidiRef.current = smoothedMidiRef.current * 0.65 + medianMidi * 0.35;
+    }
+    return smoothedMidiRef.current;
+  };
+
   const duration = transcription.duration || 10;
   const selectedNote: NoteItem | undefined = effectiveNotes[selectedNoteIndex];
 
@@ -141,9 +291,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const playCountdownBeep = (isFinal: boolean) => {
     try {
       if (isFinal) {
-        synth.playTone(1760, 0.22, 0.5); // High crisp beep for GO!
+        synth.playTone(1760, 0.22, 0.5);
       } else {
-        synth.playTone(880, 0.1, 0.35); // Lead-in beep for 3, 2, 1
+        synth.playTone(880, 0.1, 0.35);
       }
     } catch {
       // Audio context error ignore
@@ -167,7 +317,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       return;
     }
 
-    // Start countdown
     cancelCountdown();
     let currentCount = countdownDuration;
     setCountdownValue(currentCount);
@@ -179,7 +328,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         setCountdownValue(currentCount);
         playCountdownBeep(false);
       } else {
-        // Countdown reached 0
         if (countdownIntervalRef.current) {
           clearInterval(countdownIntervalRef.current);
           countdownIntervalRef.current = null;
@@ -199,18 +347,34 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const executeStartPractice = async () => {
     try {
       userPitchHistory.current = [];
+      livePitchRef.current = null;
+      recentMicMidisRef.current = [];
+      smoothedMidiRef.current = null;
+      setShowPostBlindAnalysis(false);
       const tracker = new MicPitchTracker();
       trackerRef.current = tracker;
 
       await tracker.start((data) => {
-        setLivePitch(data);
         if (data.isVoiced && audioRef.current) {
+          const rawTime = audioRef.current.currentTime;
+          // Compensate ~150ms round-trip audio/DSP latency
+          const alignedTime = Math.max(0, Math.round((rawTime - 0.15) * 1000) / 1000);
+          const cleanMidi = stabilizeUserMidi(data.midi, alignedTime);
+          const stabilizedData: LivePitchData = { ...data, midi: cleanMidi };
+          livePitchRef.current = stabilizedData;
+          setLivePitch(stabilizedData);
+
           userPitchHistory.current.push({
-            time: Math.round(audioRef.current.currentTime * 1000) / 1000,
-            frequency: data.frequency,
-            midi: data.midi,
+            time: alignedTime,
+            frequency: 440 * Math.pow(2, (cleanMidi - 69) / 12),
+            midi: cleanMidi,
             confidence: data.confidence,
           });
+        } else {
+          recentMicMidisRef.current = [];
+          smoothedMidiRef.current = null;
+          livePitchRef.current = data;
+          setLivePitch(data);
         }
       });
 
@@ -219,7 +383,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
       if (audioRef.current) {
         if (practiceMode === 'note' && selectedNote) {
-          // In Note-by-Note mode, cue slightly before note start
           audioRef.current.currentTime = Math.max(0, selectedNote.start - 0.15);
         } else {
           audioRef.current.currentTime = 0;
@@ -238,6 +401,53 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
   };
 
+  // Build continuous contour phrase segments cloning NoteItem schema types (integer id & midi)
+  const buildVocalReferenceSegments = (): NoteItem[] => {
+    if (rawContour.length === 0 || effectiveNotes.length === 0) return effectiveNotes;
+    const template = effectiveNotes[0];
+    const segments: NoteItem[] = [];
+    let segStart = -1;
+    let segMidis: number[] = [];
+
+    for (let i = 0; i < rawContour.length; i++) {
+      const pt = rawContour[i];
+      const prev = i > 0 ? rawContour[i - 1] : null;
+      const isBreak = pt.midi <= 0 || (prev && prev.midi > 0 && pt.time - prev.time > 0.2);
+
+      if (isBreak) {
+        if (segStart >= 0 && segMidis.length >= 3) {
+          const endT = prev ? prev.time : segStart + 0.1;
+          const sorted = [...segMidis].sort((a, b) => a - b);
+          const medMidi = sorted[Math.floor(sorted.length / 2)];
+          const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+          const rMidi = Math.round(medMidi);
+          const octave = Math.floor(rMidi / 12) - 1;
+          const segId = typeof template.id === 'number' ? segments.length + 1 : `vocal_seg_${segments.length}`;
+          segments.push({
+            ...template,
+            id: segId as any,
+            note_name: `${NOTE_NAMES[((rMidi % 12) + 12) % 12]}${octave}`,
+            midi: rMidi,
+            frequency: Math.round(440 * Math.pow(2, (medMidi - 69) / 12) * 100) / 100,
+            start: Math.round(segStart * 1000) / 1000,
+            end: Math.round(endT * 1000) / 1000,
+            duration: Math.max(0.1, Math.round((endT - segStart) * 1000) / 1000),
+            cents_deviation: Math.round((medMidi - rMidi) * 1000) / 10,
+            confidence: 0.95,
+          });
+        }
+        segStart = -1;
+        segMidis = [];
+      }
+
+      if (pt.midi > 0) {
+        if (segStart < 0) segStart = pt.time;
+        segMidis.push(pt.midi);
+      }
+    }
+    return segments.length > 0 ? segments : effectiveNotes;
+  };
+
   const stopPracticeSession = async () => {
     cancelCountdown();
     if (trackerRef.current) {
@@ -248,25 +458,33 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
     setMicActive(false);
     setIsPracticing(false);
+    livePitchRef.current = null;
+    recentMicMidisRef.current = [];
+    smoothedMidiRef.current = null;
+    if (blindMode) {
+      setShowPostBlindAnalysis(true);
+    }
 
-    // Call Evaluation API
     if (userPitchHistory.current.length > 0) {
       setIsEvaluating(true);
       try {
-        const evalTargetNotes = practiceMode === 'note' && selectedNote
-          ? [selectedNote]
-          : effectiveNotes;
-        const resp = await evaluatePractice(evalTargetNotes, userPitchHistory.current, 50.0);
+        const evalTargetNotes =
+          practiceMode === 'note' && selectedNote
+            ? [selectedNote]
+            : studioType === 'vocal'
+            ? buildVocalReferenceSegments()
+            : effectiveNotes;
+        const tolerance = studioType === 'vocal' ? 75.0 : 50.0;
+        const resp = await evaluatePractice(evalTargetNotes, userPitchHistory.current, tolerance);
         setEvaluation(resp);
 
-        // Record session into Smart Performance History and Project Service
         const currentSettings: PracticeConfigSettings = {
           mode: practiceMode,
           target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
           target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
           playback_speed: playbackSpeed,
           transpose_semitones: transposeSemitones,
-          tolerance_cents: 50.0,
+          tolerance_cents: tolerance,
         };
 
         const sessionAudio = audioInfo || {
@@ -284,7 +502,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         );
         onPracticeModified?.();
       } catch (err: any) {
-        console.error('Evaluation error:', err);
+        console.error('Evaluation error:', err?.message || JSON.stringify(err));
       } finally {
         setIsEvaluating(false);
       }
@@ -300,6 +518,34 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       }
     };
     animRef.current = requestAnimationFrame(render);
+  };
+
+  // Helper to check if user sang near a reference contour point ONLY for already-passed timestamps
+  const isReferencePointMatchedByUser = (
+    t: number,
+    refMidi: number,
+    currentTime: number,
+    history: PitchFrame[]
+  ): boolean => {
+    // NEVER light up points ahead of the playhead (future timeline must stay dim until reached!)
+    if (t > currentTime) return false;
+    if (history.length === 0) return false;
+
+    let lo = 0;
+    let hi = history.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (history[mid].time < t - 0.18) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < history.length; i++) {
+      const pt = history[i];
+      if (pt.time > Math.min(currentTime, t + 0.18)) break;
+      if (Math.abs(pt.midi - refMidi) <= 0.85) {
+        return true;
+      }
+    }
+    return false;
   };
 
   const drawPracticeCanvas = () => {
@@ -339,21 +585,252 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setCurrentTimeDisplay(currentTime);
     }
 
-    // Pitch Range
-    const allMidis = effectiveNotes.map((n) => n.midi);
-    const minMidi = allMidis.length > 0 ? Math.max(36, Math.min(...allMidis) - 3) : 48;
-    const maxMidi = allMidis.length > 0 ? Math.min(84, Math.max(...allMidis) + 3) : 72;
+    // Pitch Range derived from clean contour or notes
+    const validContourMidis = rawContour.filter((p) => p.midi > 0).map((p) => p.midi);
+    const allMidis = validContourMidis.length > 0 ? validContourMidis : effectiveNotes.map((n) => n.midi);
+    const minMidi = allMidis.length > 0 ? Math.max(36, Math.floor(Math.min(...allMidis)) - 2) : 48;
+    const maxMidi = allMidis.length > 0 ? Math.min(84, Math.ceil(Math.max(...allMidis)) + 2) : 72;
     const midiRange = maxMidi - minMidi || 12;
 
     const axisY = height - 20;
+    const hideReferenceGraph = blindMode && isPracticing;
+
+    // =========================================================================
+    // VOCAL  MODE: Zoomed Scrolling Timeline with Centered Fixed Playhead
+    // =========================================================================
+    if (studioType === 'vocal') {
+      const leftMargin = 38;
+      const plotWidth = width - leftMargin;
+      const centerX = leftMargin + plotWidth * 0.45;
+      const pixelsPerSecond = 145;
+
+      const timeToX = (t: number) => centerX + (t - currentTime) * pixelsPerSecond;
+      const midiToY = (m: number) => height - ((m - minMidi) / midiRange) * (height - 48) - 28;
+
+      // 1. Subtle Horizontal Staff Lines & Left Note Axis
+      for (let m = minMidi; m <= maxMidi; m++) {
+        const y = midiToY(m);
+        ctx.strokeStyle = m % 12 === 0 ? 'rgba(51, 65, 85, 0.4)' : 'rgba(30, 41, 59, 0.22)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(leftMargin, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+
+        const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+        const octave = Math.floor(m / 12) - 1;
+        ctx.fillStyle = m % 12 === 0 ? '#94a3b8' : '#475569';
+        ctx.font = '9px monospace';
+        ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
+      }
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(leftMargin, 0, plotWidth, axisY);
+      ctx.clip();
+
+      const history = userPitchHistory.current;
+
+      // 2. Single Main Reference Vocal Contour (Dim Neon Green ahead -> Bright Neon Green ONLY behind playhead when matched)
+      if (!hideReferenceGraph && rawContour.length > 1) {
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        for (let i = 1; i < rawContour.length; i++) {
+          const p1 = rawContour[i - 1];
+          const p2 = rawContour[i];
+          if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.18) continue;
+
+          const x1 = timeToX(p1.time);
+          const x2 = timeToX(p2.time);
+          if (x2 < leftMargin - 20 || x1 > width + 20) continue;
+
+          const y1 = midiToY(p1.midi);
+          const y2 = midiToY(p2.midi);
+
+          const isMatched = isReferencePointMatchedByUser(p2.time, p2.midi, currentTime, history);
+
+          if (isMatched) {
+            ctx.strokeStyle = '#39ff14';
+            ctx.lineWidth = 5;
+            ctx.shadowColor = '#39ff14';
+            ctx.shadowBlur = 12;
+          } else {
+            ctx.strokeStyle = 'rgba(57, 255, 20, 0.26)';
+            ctx.lineWidth = 3.5;
+            ctx.shadowBlur = 0;
+          }
+
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+        ctx.shadowBlur = 0;
+
+        // Subtle note labels along sustained plateaus
+        effectiveNotes.forEach((n) => {
+          if (n.duration < 0.28) return;
+          const nx = timeToX(n.start);
+          if (nx < leftMargin || nx > width) return;
+          const refY = getTargetMidiAtTime(n.start + 0.05) ?? n.midi;
+          const ny = midiToY(refY);
+          ctx.fillStyle = 'rgba(134, 239, 172, 0.65)';
+          ctx.font = 'bold 9px monospace';
+          ctx.fillText(n.note_name, nx + 2, ny - 9);
+        });
+      } else if (hideReferenceGraph) {
+        ctx.fillStyle = 'rgba(148, 163, 184, 0.22)';
+        ctx.font = 'bold 12px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('BLIND MEMORY MODE — Sing from memory', leftMargin + plotWidth / 2, height / 2);
+        ctx.textAlign = 'left';
+      }
+
+      // 3. Off-Pitch User Trace (Drawn smoothly in Red ONLY behind playhead where user sings genuinely off-pitch)
+      if (history.length > 1) {
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        for (let i = 1; i < history.length; i++) {
+          const p1 = history[i - 1];
+          const p2 = history[i];
+          if (p2.time - p1.time > 0.18 || p2.time > currentTime) continue;
+
+          const x1 = timeToX(p1.time);
+          const x2 = timeToX(p2.time);
+          if (x2 < leftMargin - 20 || x1 > width + 20) continue;
+
+          const isMatched = isUserPitchMatchedWithWindow(p2.time, p2.midi);
+          if (isMatched && !hideReferenceGraph) continue;
+
+          const y1 = midiToY(p1.midi);
+          const y2 = midiToY(p2.midi);
+
+          ctx.strokeStyle = hideReferenceGraph ? '#38bdf8' : '#ef4444';
+          ctx.lineWidth = 3.2;
+          ctx.shadowColor = hideReferenceGraph ? '#38bdf8' : '#ef4444';
+          ctx.shadowBlur = 8;
+
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+        ctx.shadowBlur = 0;
+      }
+
+      ctx.restore();
+
+      // 4. Scrolling Bottom Time Axis
+      ctx.fillStyle = '#0a101d';
+      ctx.fillRect(0, axisY, width, 20);
+      ctx.strokeStyle = '#1e293b';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(leftMargin, axisY);
+      ctx.lineTo(width, axisY);
+      ctx.stroke();
+
+      const startSec = Math.max(0, Math.floor(currentTime - (centerX - leftMargin) / pixelsPerSecond));
+      const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - centerX) / pixelsPerSecond));
+      ctx.fillStyle = '#64748b';
+      ctx.font = '9px monospace';
+      for (let t = startSec; t <= endSec; t += 1) {
+        const tx = timeToX(t);
+        if (tx < leftMargin || tx > width) continue;
+        ctx.strokeStyle = '#334155';
+        ctx.beginPath();
+        ctx.moveTo(tx, axisY);
+        ctx.lineTo(tx, axisY + 4);
+        ctx.stroke();
+        ctx.fillText(`${t}s`, tx - 6, height - 6);
+      }
+
+      // 5. Fixed Center Playhead Line & Live Pitch Ball Pointer
+      ctx.strokeStyle = 'rgba(248, 250, 252, 0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(centerX, 0);
+      ctx.lineTo(centerX, axisY);
+      ctx.stroke();
+
+      const currentLive = livePitchRef.current;
+      const targetMidiNow = getTargetMidiAtTime(currentTime);
+      let pointerMidi: number | null = null;
+      let isPointerInTune = true;
+
+      if (isPracticing && currentLive?.isVoiced) {
+        pointerMidi = currentLive.midi;
+        isPointerInTune = isUserPitchMatchedWithWindow(Math.max(0, currentTime - 0.15), currentLive.midi);
+      } else if (targetMidiNow !== null && !hideReferenceGraph) {
+        pointerMidi = targetMidiNow;
+        isPointerInTune = true;
+      }
+
+      if (pointerMidi !== null) {
+        const clampedMidi = Math.max(minMidi, Math.min(maxMidi, pointerMidi));
+        const ballY = midiToY(clampedMidi);
+        const ballColor =
+          isPracticing && currentLive?.isVoiced
+            ? (hideReferenceGraph ? '#38bdf8' : isPointerInTune ? '#39ff14' : '#ef4444')
+            : '#39ff14';
+
+        ctx.save();
+        ctx.fillStyle = ballColor;
+        ctx.shadowColor = ballColor;
+        ctx.shadowBlur = 14;
+        ctx.beginPath();
+        ctx.arc(centerX, ballY, 6.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Floating Current Second Badge on Fixed Center Playhead
+      const timeText = `${currentTime.toFixed(2)}s`;
+      ctx.font = 'bold 10px monospace';
+      const textMetrics = ctx.measureText(timeText);
+      const badgeW = textMetrics.width + 12;
+      const badgeH = 18;
+      const badgeX = centerX - badgeW / 2;
+      const badgeY = 6;
+
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+      ctx.strokeStyle = '#39ff14';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(timeText, badgeX + 6, badgeY + 13);
+      return;
+    }
+
+    // =========================================================================
+    // INSTRUMENT MODE: Scrolling Notes Moving Toward Rectangular Gate Pointer
+    // =========================================================================
+    const leftMargin = 38;
+    const plotWidth = width - leftMargin;
+    const gateX = leftMargin + plotWidth * 0.25;
+    const gateWidth = 22;
+    const pixelsPerSecond = 145;
+
+    const timeToX = (t: number) => gateX + (t - currentTime) * pixelsPerSecond;
+    const midiToY = (m: number) => height - ((m - minMidi) / midiRange) * (height - 48) - 34;
 
     // 1. Horizontal Pitch Guides
     for (let m = minMidi; m <= maxMidi; m++) {
-      const y = height - ((m - minMidi) / midiRange) * (height - 45) - 34;
+      const y = midiToY(m);
       ctx.strokeStyle = m % 12 === 0 ? '#334155' : '#111827';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(35, y);
+      ctx.moveTo(leftMargin, y);
       ctx.lineTo(width, y);
       ctx.stroke();
 
@@ -364,135 +841,146 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
     }
 
-    // 2. Reference Target Notes
-    effectiveNotes.forEach((n, idx) => {
-      const x = 35 + (n.start / duration) * (width - 35);
-      const w = Math.max(10, (n.duration / duration) * (width - 35));
-      const y = height - ((n.midi - minMidi) / midiRange) * (height - 45) - 34;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(leftMargin, 0, plotWidth, axisY);
+    ctx.clip();
 
-      const isCurrent = currentTime >= n.start && currentTime <= n.end;
-      const isSelectedInNoteMode = practiceMode === 'note' && idx === selectedNoteIndex;
+    // 2. Incoming Note Blocks Scrolling Toward the Gate
+    const currentLive = livePitchRef.current;
+    let activeGateNote: NoteItem | null = null;
 
-      if (practiceMode === 'note') {
-        if (isSelectedInNoteMode) {
-          // Highlighted Selected Target Note
-          ctx.fillStyle = 'rgba(245, 158, 11, 0.45)';
-          ctx.strokeStyle = '#fbbf24';
-          ctx.lineWidth = 2.5;
-          ctx.shadowColor = '#f59e0b';
-          ctx.shadowBlur = 12;
-        } else {
-          // Dimmed non-target notes
-          ctx.fillStyle = 'rgba(14, 165, 233, 0.08)';
-          ctx.strokeStyle = 'rgba(14, 165, 233, 0.25)';
-          ctx.lineWidth = 1;
-          ctx.shadowBlur = 0;
+    if (!hideReferenceGraph) {
+      effectiveNotes.forEach((n, idx) => {
+        const x = timeToX(n.start);
+        const w = Math.max(16, n.duration * pixelsPerSecond);
+        if (x + w < leftMargin - 20 || x > width + 20) return;
+
+        const y = midiToY(n.midi);
+        const isInsideGate = currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08;
+        if (isInsideGate) {
+          activeGateNote = n;
         }
-      } else {
-        // Full Song Mode
-        ctx.fillStyle = isCurrent ? 'rgba(56, 189, 248, 0.45)' : 'rgba(14, 165, 233, 0.2)';
-        ctx.strokeStyle = isCurrent ? '#38bdf8' : 'rgba(14, 165, 233, 0.6)';
-        ctx.lineWidth = isCurrent ? 2 : 1;
-        ctx.shadowBlur = isCurrent ? 8 : 0;
-        ctx.shadowColor = '#38bdf8';
-      }
+        const isSelectedInNoteMode = practiceMode === 'note' && idx === selectedNoteIndex;
 
-      ctx.beginPath();
-      ctx.roundRect(x, y, w, 16, 4);
-      ctx.fill();
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-
-      // Note label
-      ctx.fillStyle = isSelectedInNoteMode ? '#fef08a' : isCurrent ? '#ffffff' : '#bae6fd';
-      ctx.font = isSelectedInNoteMode ? 'bold 10px monospace' : 'bold 9px sans-serif';
-      ctx.fillText(n.note_name, x + 4, y + 11);
-
-      // In note mode, draw a small target badge above the selected note
-      if (isSelectedInNoteMode) {
-        ctx.fillStyle = '#f59e0b';
-        ctx.font = 'bold 9px monospace';
-        ctx.fillText('▼ TARGET', Math.max(35, x), y - 4);
-      }
-    });
-
-    // 3. User Singing Pitch Trajectory (Live Real-time Curve)
-    const history = userPitchHistory.current;
-    if (history.length > 1) {
-      for (let i = 1; i < history.length; i++) {
-        const p1 = history[i - 1];
-        const p2 = history[i];
-
-        if (p2.time - p1.time > 0.12) continue; // Gap
-
-        const x1 = 35 + (p1.time / duration) * (width - 35);
-        const y1 = height - ((p1.midi - minMidi) / midiRange) * (height - 45) - 26;
-        const x2 = 35 + (p2.time / duration) * (width - 35);
-        const y2 = height - ((p2.midi - minMidi) / midiRange) * (height - 45) - 26;
-
-        // Check if pitch is near target note (within ±0.5 semitone = 50 cents)
-        const refNote = practiceMode === 'note' && selectedNote
-          ? selectedNote
-          : effectiveNotes.find((n) => p2.time >= n.start && p2.time <= n.end);
-
-        const isHit = refNote && Math.abs(p2.midi - refNote.midi) <= 0.5;
-
-        ctx.strokeStyle = isHit ? '#10b981' : '#f59e0b'; // Emerald if hit, amber if drift
-        ctx.lineWidth = isHit ? 3.5 : 2.5;
-        ctx.shadowColor = isHit ? '#10b981' : '#f59e0b';
-        ctx.shadowBlur = 6;
+        if (practiceMode === 'note') {
+          if (isSelectedInNoteMode) {
+            ctx.fillStyle = 'rgba(245, 158, 11, 0.45)';
+            ctx.strokeStyle = '#fbbf24';
+            ctx.lineWidth = 2.5;
+            ctx.shadowColor = '#f59e0b';
+            ctx.shadowBlur = 12;
+          } else {
+            ctx.fillStyle = 'rgba(14, 165, 233, 0.08)';
+            ctx.strokeStyle = 'rgba(14, 165, 233, 0.25)';
+            ctx.lineWidth = 1;
+            ctx.shadowBlur = 0;
+          }
+        } else {
+          ctx.fillStyle = isInsideGate ? 'rgba(56, 189, 248, 0.45)' : 'rgba(14, 165, 233, 0.22)';
+          ctx.strokeStyle = isInsideGate ? '#38bdf8' : 'rgba(14, 165, 233, 0.65)';
+          ctx.lineWidth = isInsideGate ? 2.2 : 1.2;
+          ctx.shadowBlur = isInsideGate ? 10 : 0;
+          ctx.shadowColor = '#38bdf8';
+        }
 
         ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
+        ctx.roundRect(x, y, w, 18, 5);
+        ctx.fill();
         ctx.stroke();
         ctx.shadowBlur = 0;
+
+        ctx.fillStyle = isSelectedInNoteMode ? '#fef08a' : isInsideGate ? '#ffffff' : '#bae6fd';
+        ctx.font = 'bold 10px monospace';
+        ctx.fillText(n.note_name, x + 5, y + 12);
+      });
+    }
+
+    // 3. Rectangular Gate Pointer
+    let gateStroke = 'rgba(148, 163, 184, 0.55)';
+    let gateFill = 'rgba(148, 163, 184, 0.07)';
+    let gateGlow = 'transparent';
+
+    if (isPracticing && currentLive?.isVoiced) {
+      const targetNote = practiceMode === 'note' && selectedNote ? selectedNote : activeGateNote;
+      if (targetNote) {
+        const isCorrectNote = Math.abs(currentLive.midi - targetNote.midi) <= 0.65;
+        if (isCorrectNote) {
+          gateStroke = '#39ff14';
+          gateFill = 'rgba(57, 255, 20, 0.16)';
+          gateGlow = '#39ff14';
+        } else {
+          gateStroke = '#ef4444';
+          gateFill = 'rgba(239, 68, 68, 0.22)';
+          gateGlow = '#ef4444';
+        }
+      } else {
+        gateStroke = '#ef4444';
+        gateFill = 'rgba(239, 68, 68, 0.16)';
+        gateGlow = '#ef4444';
       }
     }
 
-    // 4. Bottom Time Axis & Second Markings
+    ctx.save();
+    ctx.fillStyle = gateFill;
+    ctx.strokeStyle = gateStroke;
+    ctx.lineWidth = 2.5;
+    if (gateGlow !== 'transparent') {
+      ctx.shadowColor = gateGlow;
+      ctx.shadowBlur = 16;
+    }
+    ctx.beginPath();
+    ctx.roundRect(gateX - gateWidth / 2, 24, gateWidth, axisY - 28, 6);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    if (isPracticing && currentLive?.isVoiced) {
+      const clampedMidi = Math.max(minMidi, Math.min(maxMidi, currentLive.midi));
+      const userGateY = midiToY(clampedMidi) + 9;
+      ctx.fillStyle = gateStroke;
+      ctx.beginPath();
+      ctx.roundRect(gateX - gateWidth / 2 + 2, userGateY - 5, gateWidth - 4, 10, 3);
+      ctx.fill();
+    }
+
+    ctx.restore();
+
+    // 4. Bottom Scrolling Time Axis
     ctx.fillStyle = '#0a101d';
     ctx.fillRect(0, axisY, width, 20);
     ctx.strokeStyle = '#1e293b';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(35, axisY);
+    ctx.moveTo(leftMargin, axisY);
     ctx.lineTo(width, axisY);
     ctx.stroke();
 
-    const timeStep = duration > 20 ? 4.0 : duration > 10 ? 2.0 : duration > 5 ? 1.0 : 0.5;
+    const startSec = Math.max(0, Math.floor(currentTime - (gateX - leftMargin) / pixelsPerSecond));
+    const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - gateX) / pixelsPerSecond));
     ctx.fillStyle = '#64748b';
     ctx.font = '9px monospace';
-    for (let t = 0; t <= duration; t += timeStep) {
-      const tx = 35 + (t / duration) * (width - 35);
+    for (let t = startSec; t <= endSec; t += 1) {
+      const tx = timeToX(t);
+      if (tx < leftMargin || tx > width) continue;
       ctx.strokeStyle = '#334155';
       ctx.beginPath();
       ctx.moveTo(tx, axisY);
       ctx.lineTo(tx, axisY + 4);
       ctx.stroke();
-      ctx.fillText(`${t.toFixed(1)}s`, Math.max(35, tx - 10), height - 6);
+      ctx.fillText(`${t}s`, tx - 6, height - 6);
     }
 
-    // 5. Playhead Line & Floating Current Second Badge
-    const cursorX = 35 + (currentTime / duration) * (width - 35);
-    ctx.strokeStyle = '#f43f5e';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(cursorX, 0);
-    ctx.lineTo(cursorX, axisY);
-    ctx.stroke();
-
-    // Floating Current Second Badge attached to Playhead
     const timeText = `${currentTime.toFixed(2)}s`;
     ctx.font = 'bold 10px monospace';
     const textMetrics = ctx.measureText(timeText);
     const badgeW = textMetrics.width + 12;
     const badgeH = 18;
-    const badgeX = Math.max(35, Math.min(width - badgeW - 4, cursorX - badgeW / 2));
-    const badgeY = 6;
+    const badgeX = gateX - badgeW / 2;
+    const badgeY = 4;
 
     ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-    ctx.strokeStyle = '#f43f5e';
+    ctx.strokeStyle = gateStroke;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
@@ -505,7 +993,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   useEffect(() => {
     drawPracticeCanvas();
-  }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, selectedNoteIndex]);
+  }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, selectedNoteIndex, studioType, blindMode, showPostBlindAnalysis]);
 
   // Click directly on canvas to select and audition a note
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -517,17 +1005,24 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
-    const allMidis = effectiveNotes.map((n) => n.midi);
-    const minMidi = allMidis.length > 0 ? Math.max(36, Math.min(...allMidis) - 3) : 48;
-    const maxMidi = allMidis.length > 0 ? Math.min(84, Math.max(...allMidis) + 3) : 72;
+    const currentTime = audioRef.current ? audioRef.current.currentTime : 0;
+    const leftMargin = 38;
+    const plotWidth = width - leftMargin;
+    const anchorX = studioType === 'instrument' ? leftMargin + plotWidth * 0.25 : leftMargin + plotWidth * 0.45;
+    const pixelsPerSecond = 145;
+
+    const validContourMidis = rawContour.filter((p) => p.midi > 0).map((p) => p.midi);
+    const allMidis = validContourMidis.length > 0 ? validContourMidis : effectiveNotes.map((n) => n.midi);
+    const minMidi = allMidis.length > 0 ? Math.max(36, Math.floor(Math.min(...allMidis)) - 2) : 48;
+    const maxMidi = allMidis.length > 0 ? Math.min(84, Math.ceil(Math.max(...allMidis)) + 2) : 72;
     const midiRange = maxMidi - minMidi || 12;
 
     for (let i = 0; i < effectiveNotes.length; i++) {
       const n = effectiveNotes[i];
-      const nx = 35 + (n.start / duration) * (width - 35);
-      const nw = Math.max(10, (n.duration / duration) * (width - 35));
-      const ny = height - ((n.midi - minMidi) / midiRange) * (height - 45) - 34;
-      const nh = 16;
+      const nx = anchorX + (n.start - currentTime) * pixelsPerSecond;
+      const nw = Math.max(16, n.duration * pixelsPerSecond);
+      const ny = height - ((n.midi - minMidi) / midiRange) * (height - 48) - 34;
+      const nh = 18;
 
       if (clickX >= nx - 4 && clickX <= nx + nw + 4 && clickY >= ny - 4 && clickY <= ny + nh + 4) {
         setSelectedNoteIndex(i);
@@ -653,45 +1148,93 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           </div>
         </div>
 
-        {/* Practice Mode Switcher (Full Song vs Note-by-Note) */}
+        {/* Practice Mode Switcher (Vocal vs Instrument + Full Song vs Note-by-Note + Blind Mode) */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
-          <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Domain Mode: Vocal vs Instrument */}
+            <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
+              <button
+                onClick={() => setStudioType('vocal')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                  studioType === 'vocal'
+                    ? 'bg-emerald-950/60 border border-emerald-500/60 text-emerald-300 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Mic2 className="w-3.5 h-3.5" />
+                <span>Vocal</span>
+              </button>
+              <button
+                onClick={() => setStudioType('instrument')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                  studioType === 'instrument'
+                    ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Piano className="w-3.5 h-3.5" />
+                <span>Instrument</span>
+              </button>
+            </div>
+
+            {/* Phrase Scope: Full Song vs Note-by-Note */}
+            <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
+              <button
+                onClick={() => {
+                  if (isPracticing) stopPracticeSession();
+                  cancelCountdown();
+                  setPracticeMode('full');
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                  practiceMode === 'full'
+                    ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Music className="w-3.5 h-3.5" />
+                <span>Full Song Mode</span>
+              </button>
+              <button
+                onClick={() => {
+                  if (isPracticing) stopPracticeSession();
+                  cancelCountdown();
+                  setPracticeMode('note');
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                  practiceMode === 'note'
+                    ? 'bg-amber-950/50 border border-amber-500/60 text-amber-300 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Target className="w-3.5 h-3.5" />
+                <span>Note-by-Note Mode</span>
+              </button>
+            </div>
+
+            {/* Blind Memory Mode Toggle */}
             <button
               onClick={() => {
-                if (isPracticing) stopPracticeSession();
-                cancelCountdown();
-                setPracticeMode('full');
+                setBlindMode((prev) => !prev);
+                setShowPostBlindAnalysis(false);
               }}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                practiceMode === 'full'
-                  ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition-all ${
+                blindMode
+                  ? 'bg-purple-950/60 border-purple-500/60 text-purple-300 shadow-sm'
+                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
               }`}
+              title="Hide target graph while singing to test memorization, then reveal comparison after stopping"
             >
-              <Music className="w-3.5 h-3.5" />
-              <span>Full Song Mode</span>
-            </button>
-            <button
-              onClick={() => {
-                if (isPracticing) stopPracticeSession();
-                cancelCountdown();
-                setPracticeMode('note');
-              }}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                practiceMode === 'note'
-                  ? 'bg-amber-950/50 border border-amber-500/60 text-amber-300 shadow-sm'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Target className="w-3.5 h-3.5" />
-              <span>Note-by-Note Mode</span>
+              {blindMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              <span>Blind Mode: {blindMode ? 'On' : 'Off'}</span>
             </button>
           </div>
 
           <div className="text-xs text-slate-500">
             {practiceMode === 'note'
               ? 'Click any note on the timeline or use buttons below to switch target'
-              : 'Continuous playback across all extracted musical notes'}
+              : studioType === 'vocal'
+              ? 'Zoomed scrolling contour — center cursor tracks your voice in real time'
+              : 'Rhythm Gate mode — play notes accurately as they pass through the gate'}
           </div>
         </div>
 
@@ -979,13 +1522,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       {/* Dual Layer Real-time Pitch Canvas Container */}
       <div className="daw-panel p-4 border border-slate-800 bg-slate-900/50 rounded-2xl space-y-2 relative">
         <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-          <span className="flex items-center gap-1.5 text-cyan-300">
-            <span className="w-3 h-2 bg-cyan-500/30 border border-cyan-400 rounded-xs"></span>
-            Target Melody Notes
+          <span className={`flex items-center gap-1.5 ${studioType === 'vocal' ? 'text-emerald-300' : 'text-cyan-300'}`}>
+            <span className={`w-3 h-2 rounded-xs ${studioType === 'vocal' ? 'bg-[#39ff14]/30 border border-[#39ff14]' : 'bg-cyan-500/30 border border-cyan-400'}`}></span>
+            {studioType === 'vocal' ? 'Main Vocal Contour (Lights up Bright Neon Green when matched)' : 'Incoming Notes -> Rectangular Gate'}
           </span>
-          <span className="flex items-center gap-1.5 text-emerald-300">
-            <span className="w-2.5 h-1 bg-emerald-400 rounded-full"></span>
-            Your Live Singing Trace
+          <span className="flex items-center gap-1.5 text-rose-300">
+            <span className="w-2.5 h-2.5 bg-rose-500 rounded-full"></span>
+            {studioType === 'vocal' ? 'Off-Pitch Singing Trace (Red)' : 'Gate Turns Green on Hit / Red on Wrong Note'}
           </span>
         </div>
 
