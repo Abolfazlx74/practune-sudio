@@ -1240,110 +1240,120 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
         {/* Note-by-Note Dedicated Control Toolbar */}
         {practiceMode === 'note' && (
-          <div className="p-3.5 rounded-xl bg-slate-950/90 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3">
-            {/* Note Stepping & Audition */}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => {
-                    const nextIdx = Math.max(0, selectedNoteIndex - 1);
-                    setSelectedNoteIndex(nextIdx);
-                    const note = effectiveNotes[nextIdx];
-                    if (note) {
-                      synth.playMidiNote(note.midi, 0.4);
-                      if (audioRef.current && !isPracticing) {
-                        audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                        setCurrentTimeDisplay(audioRef.current.currentTime);
+          <div
+            className="p-3.5 rounded-xl bg-slate-950/80 flex flex-col gap-2.5 w-full"
+            style={{ border: 'none' }}
+          >
+            {/* Top Row: Note Stepping & Audition Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 w-full">
+              {/* Note Stepping & Audition */}
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => {
+                      const nextIdx = Math.max(0, selectedNoteIndex - 1);
+                      setSelectedNoteIndex(nextIdx);
+                      const note = effectiveNotes[nextIdx];
+                      if (note) {
+                        synth.playMidiNote(note.midi, 0.4);
+                        if (audioRef.current && !isPracticing) {
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          setCurrentTimeDisplay(audioRef.current.currentTime);
+                        }
                       }
-                    }
-                  }}
-                  disabled={selectedNoteIndex <= 0}
-                  className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                  title="Previous Note (←)"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <button
-                  onClick={() => {
-                    const nextIdx = Math.min(effectiveNotes.length - 1, selectedNoteIndex + 1);
-                    setSelectedNoteIndex(nextIdx);
-                    const note = effectiveNotes[nextIdx];
-                    if (note) {
-                      synth.playMidiNote(note.midi, 0.4);
-                      if (audioRef.current && !isPracticing) {
-                        audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                        setCurrentTimeDisplay(audioRef.current.currentTime);
+                    }}
+                    disabled={selectedNoteIndex <= 0}
+                    className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                    title="Previous Note (←)"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => {
+                      const nextIdx = Math.min(effectiveNotes.length - 1, selectedNoteIndex + 1);
+                      setSelectedNoteIndex(nextIdx);
+                      const note = effectiveNotes[nextIdx];
+                      if (note) {
+                        synth.playMidiNote(note.midi, 0.4);
+                        if (audioRef.current && !isPracticing) {
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          setCurrentTimeDisplay(audioRef.current.currentTime);
+                        }
                       }
-                    }
-                  }}
-                  disabled={selectedNoteIndex >= effectiveNotes.length - 1}
-                  className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                  title="Next Note (→)"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
+                    }}
+                    disabled={selectedNoteIndex >= effectiveNotes.length - 1}
+                    className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                    title="Next Note (→)"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Target Note Badge */}
+                {selectedNote && (
+                  <div className="flex items-center gap-2 px-3 py-1 bg-amber-950/40 border border-amber-500/40 rounded-xl">
+                    <Target className="w-4 h-4 text-amber-400" />
+                    <span className="text-xs text-slate-400">Target Note {selectedNoteIndex + 1}/{effectiveNotes.length}:</span>
+                    <strong className="text-sm font-mono font-bold text-amber-300">{selectedNote.note_name}</strong>
+                    <span className="text-xs text-slate-400 font-mono">({selectedNote.frequency.toFixed(1)} Hz)</span>
+                    <span className="text-xs text-slate-500 font-mono">[{selectedNote.start.toFixed(2)}s - {selectedNote.end.toFixed(2)}s]</span>
+                  </div>
+                )}
               </div>
 
-              {/* Target Note Badge */}
-              {selectedNote && (
-                <div className="flex items-center gap-2 px-3 py-1 bg-amber-950/40 border border-amber-500/40 rounded-xl">
-                  <Target className="w-4 h-4 text-amber-400" />
-                  <span className="text-xs text-slate-400">Target Note {selectedNoteIndex + 1}/{effectiveNotes.length}:</span>
-                  <strong className="text-sm font-mono font-bold text-amber-300">{selectedNote.note_name}</strong>
-                  <span className="text-xs text-slate-400 font-mono">({selectedNote.frequency.toFixed(1)} Hz)</span>
-                  <span className="text-xs text-slate-500 font-mono">[{selectedNote.start.toFixed(2)}s - {selectedNote.end.toFixed(2)}s]</span>
-                </div>
-              )}
+              {/* Action Buttons: Hear Pitch & Loop Note */}
+              <div className="flex items-center gap-2">
+                {selectedNote && (
+                  <button
+                    onClick={() => synth.playMidiNote(selectedNote.midi, 0.6)}
+                    className="flex items-center gap-1.5 px-3 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-cyan-300 transition-all"
+                    title="Hear target note pitch with reference synth"
+                  >
+                    <Volume2 className="w-3.5 h-3.5" />
+                    <span>Hear Pitch</span>
+                  </button>
+                )}
 
-              {/* Audition Note with Synth */}
-              {selectedNote && (
                 <button
-                  onClick={() => synth.playMidiNote(selectedNote.midi, 0.6)}
-                  className="flex items-center gap-1.5 px-3 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-cyan-300 transition-all"
-                  title="Hear target note pitch with reference synth"
+                  onClick={() => setLoopNote((prev) => !prev)}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
+                    loopNote
+                      ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="Loop playback on this specific note"
                 >
-                  <Volume2 className="w-3.5 h-3.5" />
-                  <span>Hear Pitch</span>
+                  <Repeat className="w-3.5 h-3.5" />
+                  <span>Loop Note</span>
                 </button>
-              )}
-
-              {/* Loop Note Toggle */}
-              <button
-                onClick={() => setLoopNote((prev) => !prev)}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
-                  loopNote
-                    ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
-                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                }`}
-                title="Loop playback on this specific note"
-              >
-                <Repeat className="w-3.5 h-3.5" />
-                <span>Loop Note</span>
-              </button>
+              </div>
             </div>
 
-            {/* Quick Note Selector Carousel */}
-            <div className="flex items-center gap-1.5 overflow-x-auto max-w-full py-1">
-              {effectiveNotes.map((note, idx) => (
-                <button
-                  key={note.id || idx}
-                  onClick={() => {
-                    setSelectedNoteIndex(idx);
-                    synth.playMidiNote(note.midi, 0.4);
-                    if (audioRef.current && !isPracticing) {
-                      audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                      setCurrentTimeDisplay(audioRef.current.currentTime);
-                    }
-                  }}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold transition-all shrink-0 ${
-                    idx === selectedNoteIndex
-                      ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30'
-                      : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
-                  }`}
-                >
-                  {idx + 1}. {note.note_name}
-                </button>
-              ))}
+            {/* Bottom Row: Quick Note Selector Carousel (Always starts on its own line) */}
+            <div className="w-full">
+              <div className="flex items-center gap-1.5 overflow-x-auto max-w-full py-1">
+                {effectiveNotes.map((note, idx) => (
+                  <button
+                    key={note.id || idx}
+                    onClick={() => {
+                      setSelectedNoteIndex(idx);
+                      synth.playMidiNote(note.midi, 0.4);
+                      if (audioRef.current && !isPracticing) {
+                        audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                        setCurrentTimeDisplay(audioRef.current.currentTime);
+                      }
+                    }}
+                    style={{ width: '74px', minWidth: '74px', maxWidth: '74px' }}
+                    className={`h-8 rounded-lg text-xs font-mono font-bold transition-all shrink-0 flex items-center justify-center text-center ${
+                      idx === selectedNoteIndex
+                        ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30'
+                        : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                    }`}
+                  >
+                    {idx + 1}. {note.note_name}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         )}
@@ -1549,8 +1559,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 </div>
                 <p className="text-sm font-semibold tracking-wider text-slate-300 uppercase">
                   {practiceMode === 'note' && selectedNote
-                    ? `Get Ready for Note: ${selectedNote.note_name}`
-                    : 'Get ready to sing with the track...'}
+                    ? `Get ready for note: ${selectedNote.note_name} (${countdownValue})`
+                    : `Get ready for the track (${countdownValue})`}
                 </p>
                 <button
                   onClick={cancelCountdown}
