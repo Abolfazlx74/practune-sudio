@@ -58,7 +58,7 @@ def extract_instrument_main_notes(notes: List[NoteItem]) -> List[NoteItem]:
 
 def extract_vocal_main_notes(notes: List[NoteItem]) -> List[NoteItem]:
     """
-    Filters ultra-short inter-syllable pitch glides (< 85ms) in Vocal/Quran mode
+    Filters ultra-short inter-syllable pitch glides (< 85ms) in Vocal mode
     so natural transitions between words do not cause artificial score drops.
     """
     if len(notes) <= 1:
@@ -523,7 +523,7 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             if is_hit:
                 notes_hit_count += 1
         else:
-            # Vocal / Quran Mode: Balanced intonation & vibrato scoring (no double-penalty)
+            # Vocal Mode: Balanced intonation & vibrato scoring (no double-penalty)
             attack_margin = min(0.06, dur * 0.22)
             release_margin = min(0.05, dur * 0.20)
 

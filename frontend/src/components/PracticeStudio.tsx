@@ -18,11 +18,12 @@ import {
   EyeOff,
   Mic2,
   Piano,
+  Upload,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
 import type { LivePitchData } from '../services/micPitchTracker';
-import { getAudioFileUrl, evaluatePractice } from '../services/api';
+import { getAudioFileUrl, evaluatePractice, evaluateRecordedPerformance } from '../services/api';
 import { synth } from '../services/synth';
 import { recordPracticeSession } from '../services/historyService';
 import { recordPerformanceToProject } from '../services/projectService';
@@ -63,9 +64,11 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [livePitch, setLivePitch] = useState<LivePitchData | null>(null);
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  // Studio Domain Mode (Vocal/Quran vs Instrument) & Blind Memory Mode
+  // Studio Domain Mode (Vocal vs Instrument) & Blind Memory Mode
   const [studioType, setStudioType] = useState<'vocal' | 'instrument'>('vocal');
   const [blindMode, setBlindMode] = useState<boolean>(false);
   const [showPostBlindAnalysis, setShowPostBlindAnalysis] = useState<boolean>(false);
@@ -507,6 +510,56 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
   };
 
+  const handleImportPerformanceClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
+    }
+  };
+
+  const handlePerformanceFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsImporting(true);
+    try {
+      const tolerance = studioType === 'vocal' ? 60.0 : 70.0;
+      const resp = await evaluateRecordedPerformance(
+        audioId,
+        file,
+        tolerance,
+        transposeSemitones,
+        studioType
+      );
+      setEvaluation(resp);
+
+      const currentSettings: PracticeConfigSettings = {
+        mode: practiceMode,
+        playback_speed: playbackSpeed,
+        transpose_semitones: transposeSemitones,
+        tolerance_cents: tolerance,
+      };
+
+      const sessionAudio = audioInfo || {
+        id: audioId,
+        filename: `${transcription.key_estimate || 'Melody'}_imported.wav`,
+        duration: duration,
+      };
+
+      recordPracticeSession(sessionAudio, currentSettings, resp);
+      await recordPerformanceToProject(
+        currentProjectId || audioId,
+        sessionAudio,
+        currentSettings,
+        resp
+      );
+      onPracticeModified?.();
+    } catch (err: any) {
+      alert(`Import evaluation error: ${err.message || 'Failed to analyze recording.'}`);
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
   // Canvas Real-time Render Loop
   const startCanvasRenderLoop = () => {
     const render = () => {
@@ -633,7 +686,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const hideReferenceGraph = blindMode && isPracticing;
 
     // =========================================================================
-    // VOCAL / QURAN MODE: Reference-Video Style Smooth Contour + Concentric Ring
+    // VOCAL MODE: Reference-Video Style Smooth Contour + Concentric Ring
     // =========================================================================
     if (studioType === 'vocal') {
       const leftMargin = 38;
@@ -1184,7 +1237,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
             </button>
 
-            {/* Start / Finish Action Button */}
+            {/* Start / Finish Action Button & Import Performance Option */}
             {!isPracticing ? (
               countdownValue !== null ? (
                 <button
@@ -1195,13 +1248,33 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                   Starting in {countdownValue}s... (Cancel)
                 </button>
               ) : (
-                <button
-                  onClick={handleStartPracticeClick}
-                  className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
-                >
-                  <Play className="w-4 h-4 fill-current ml-0.5" />
-                  {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleStartPracticeClick}
+                    className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
+                  >
+                    <Play className="w-4 h-4 fill-current ml-0.5" />
+                    {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleImportPerformanceClick}
+                    disabled={isImporting}
+                    className="flex items-center gap-2 px-4 py-2.5 rounded-xl border border-slate-700 bg-slate-800/90 hover:bg-slate-700 text-slate-200 text-sm font-semibold shadow-md transition"
+                    title="Import an audio recording of your performance to evaluate against reference"
+                  >
+                    <Upload className="w-4 h-4 text-cyan-400" />
+                    {isImporting ? 'Analyzing Take...' : 'Import Performance'}
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="audio/*"
+                    onChange={handlePerformanceFileChange}
+                    className="hidden"
+                  />
+                </div>
               )
             ) : (
               <button
@@ -1215,10 +1288,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           </div>
         </div>
 
-        {/* Practice Mode Switcher (Vocal/Quran vs Instrument + Full Song vs Note-by-Note + Blind Mode) */}
+        {/* Practice Mode Switcher (Vocal vs Instrument + Full Song vs Note-by-Note + Blind Mode) */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
           <div className="flex flex-wrap items-center gap-2">
-            {/* Domain Mode: Vocal/Quran vs Instrument */}
+            {/* Domain Mode: Vocal vs Instrument */}
             <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
               <button
                 onClick={() => setStudioType('vocal')}
@@ -1229,7 +1302,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 }`}
               >
                 <Mic2 className="w-3.5 h-3.5" />
-                <span>Vocal / Quran</span>
+                <span>Vocal</span>
               </button>
               <button
                 onClick={() => setStudioType('instrument')}
