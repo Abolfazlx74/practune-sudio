@@ -73,9 +73,16 @@ export interface EvaluationResponse {
   pitch_accuracy: number;
   timing_accuracy: number;
   sequence_accuracy: number;
+  note_coverage: number;
   overall_score: number;
   feedback: string[];
   note_scores: NoteScore[];
+  detected_reference_notes_count?: number;
+  detected_live_notes_count?: number;
+  missed_notes_count?: number;
+  extra_notes_count?: number;
+  alignment_offset_ms?: number;
+  avg_cents_error?: number;
 }
 
 export interface PerformanceRecord {

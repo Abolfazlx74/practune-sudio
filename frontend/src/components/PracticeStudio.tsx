@@ -233,7 +233,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     return targetMidi !== null && Math.abs(userMidi - targetMidi) <= 0.65;
   };
 
-  // Multi-stage Mic Stabilizer: Median Despike + Octave Lock + Smooth EMA
+  // Fast median despiker with octave lock (zero phase-delay lag on note transitions)
   const stabilizeUserMidi = (rawMidi: number, timestamp: number): number => {
     let corrected = rawMidi;
     const refMidi = getTargetMidiAtTime(timestamp);
@@ -241,23 +241,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     if (refMidi !== null) {
       if (Math.abs((corrected - 12) - refMidi) <= 1.6) corrected -= 12;
       else if (Math.abs((corrected + 12) - refMidi) <= 1.6) corrected += 12;
-    } else if (smoothedMidiRef.current !== null) {
-      if (Math.abs((corrected - 12) - smoothedMidiRef.current) <= 1.6) corrected -= 12;
-      else if (Math.abs((corrected + 12) - smoothedMidiRef.current) <= 1.6) corrected += 12;
     }
 
     const buf = recentMicMidisRef.current;
     buf.push(corrected);
-    if (buf.length > 5) buf.shift();
+    if (buf.length > 3) buf.shift();
     const sorted = [...buf].sort((a, b) => a - b);
-    const medianMidi = sorted[Math.floor(sorted.length / 2)];
-
-    if (smoothedMidiRef.current === null || Math.abs(medianMidi - smoothedMidiRef.current) > 6) {
-      smoothedMidiRef.current = medianMidi;
-    } else {
-      smoothedMidiRef.current = smoothedMidiRef.current * 0.65 + medianMidi * 0.35;
-    }
-    return smoothedMidiRef.current;
+    return sorted[Math.floor(sorted.length / 2)];
   };
 
   const duration = transcription.duration || 10;
@@ -357,15 +347,14 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       await tracker.start((data) => {
         if (data.isVoiced && audioRef.current) {
           const rawTime = audioRef.current.currentTime;
-          // Compensate ~150ms round-trip audio/DSP latency
-          const alignedTime = Math.max(0, Math.round((rawTime - 0.15) * 1000) / 1000);
-          const cleanMidi = stabilizeUserMidi(data.midi, alignedTime);
+          const exactTime = Math.max(0, Math.round(rawTime * 1000) / 1000);
+          const cleanMidi = stabilizeUserMidi(data.midi, exactTime);
           const stabilizedData: LivePitchData = { ...data, midi: cleanMidi };
           livePitchRef.current = stabilizedData;
           setLivePitch(stabilizedData);
 
           userPitchHistory.current.push({
-            time: alignedTime,
+            time: exactTime,
             frequency: 440 * Math.pow(2, (cleanMidi - 69) / 12),
             midi: cleanMidi,
             confidence: data.confidence,
@@ -471,10 +460,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         const evalTargetNotes =
           practiceMode === 'note' && selectedNote
             ? [selectedNote]
-            : studioType === 'vocal'
-            ? buildVocalReferenceSegments()
             : effectiveNotes;
-        const tolerance = studioType === 'vocal' ? 75.0 : 50.0;
+        const tolerance = studioType === 'vocal' ? 60.0 : 50.0;
         const resp = await evaluatePractice(evalTargetNotes, userPitchHistory.current, tolerance);
         setEvaluation(resp);
 

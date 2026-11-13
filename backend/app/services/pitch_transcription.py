@@ -64,7 +64,7 @@ def run_yin_transcription(y: np.ndarray, sr: int) -> Tuple[List[NoteItem], List[
 
     onset_times = set([round(t, 2) for t in detect_onsets(y, sr, hop_size=hop_length)])
 
-    # Segment pitch frames into discrete musical notes
+    # Segment pitch frames into discrete musical notes with vibrato-resistant hysteresis
     notes: List[NoteItem] = []
     current_segment: List[PitchFrame] = []
 
@@ -89,25 +89,31 @@ def run_yin_transcription(y: np.ndarray, sr: int) -> Tuple[List[NoteItem], List[
             note_name=note_name,
             octave=octave,
             start=round(seg[0].time, 3),
-            end=round(seg[-1].time + 0.03, 3),
-            duration=round(seg_duration + 0.03, 3),
+            end=round(seg[-1].time, 3),
+            duration=round(max(0.04, seg_duration), 3),
             confidence=round(conf, 2),
             frequency=round(freq, 1),
             cents_deviation=cents_dev
         ))
 
-    for frame in pitch_frames:
+    # Rolling median (window 3) for hysteresis to avoid fracturing sustained vibrato
+    smoothed_midis = []
+    for k in range(len(pitch_frames)):
+        window = [pitch_frames[j].midi for j in range(max(0, k - 1), min(len(pitch_frames), k + 2))]
+        smoothed_midis.append(float(np.median(window)))
+
+    for idx, frame in enumerate(pitch_frames):
         if not current_segment:
             current_segment.append(frame)
             continue
 
         prev_frame = current_segment[-1]
         time_gap = frame.time - prev_frame.time
-        pitch_jump = abs(frame.midi - prev_frame.midi)
-        is_onset = any(abs(frame.time - ot) < 0.05 for ot in onset_times)
+        smooth_jump = abs(smoothed_midis[idx] - smoothed_midis[idx - 1])
+        is_onset = any(abs(frame.time - ot) < 0.04 for ot in onset_times)
 
-        # Break note on silence gap (> 80ms), pitch jump (> 0.8 semitones), or distinct onset
-        if time_gap > 0.08 or pitch_jump > 0.8 or is_onset:
+        # Break note on silence gap (> 85ms), distinct onset, or sustained pitch jump (>= 0.85 semitones)
+        if time_gap > 0.085 or (smooth_jump >= 0.85 and time_gap > 0.03) or is_onset:
             commit_segment(current_segment)
             current_segment = [frame]
         else:

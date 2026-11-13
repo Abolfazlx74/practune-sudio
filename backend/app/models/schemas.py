@@ -78,6 +78,14 @@ class EvaluationResponse(BaseModel):
     pitch_accuracy: float
     timing_accuracy: float
     sequence_accuracy: float
+    note_coverage: float = 100.0
     overall_score: float
     feedback: List[str]
     note_scores: List[NoteScore] = []
+    # Diagnostic / transparency fields
+    detected_reference_notes_count: int = 0
+    detected_live_notes_count: int = 0
+    missed_notes_count: int = 0
+    extra_notes_count: int = 0
+    alignment_offset_ms: float = 0.0
+    avg_cents_error: float = 0.0

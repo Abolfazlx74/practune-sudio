@@ -85,13 +85,13 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
           </div>
 
           {/* Sub-Metrics Cards */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center space-y-1">
               <span className="text-[11px] text-slate-400 font-medium">Pitch Accuracy</span>
               <div className="text-xl font-bold font-mono text-cyan-400">
                 {evaluation.pitch_accuracy}%
               </div>
-              <span className="text-[10px] text-slate-500">±50¢ tolerance</span>
+              <span className="text-[10px] text-slate-500">Cents tolerance</span>
             </div>
 
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center space-y-1">
@@ -103,13 +103,31 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
             </div>
 
             <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center space-y-1">
+              <span className="text-[11px] text-slate-400 font-medium">Note Coverage</span>
+              <div className="text-xl font-bold font-mono text-teal-400">
+                {evaluation.note_coverage ?? 100}%
+              </div>
+              <span className="text-[10px] text-slate-500">Notes captured</span>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center space-y-1">
               <span className="text-[11px] text-slate-400 font-medium">Note Sequence</span>
               <div className="text-xl font-bold font-mono text-emerald-400">
                 {evaluation.sequence_accuracy}%
               </div>
-              <span className="text-[10px] text-slate-500">Melodic flow</span>
+              <span className="text-[10px] text-slate-500">Melodic order</span>
             </div>
           </div>
+
+          {/* Diagnostic Transparency Pill */}
+          {evaluation.alignment_offset_ms !== undefined && (
+            <div className="px-3 py-1.5 rounded-xl bg-slate-950/70 border border-slate-800 text-[11px] text-slate-400 flex flex-wrap items-center justify-between gap-2 font-mono">
+              <span>Latency Offset: <strong className="text-cyan-400">{evaluation.alignment_offset_ms > 0 ? `+${evaluation.alignment_offset_ms}` : evaluation.alignment_offset_ms}ms</strong></span>
+              <span>Avg Cents Deviation: <strong className="text-amber-400">±{evaluation.avg_cents_error ?? 0}¢</strong></span>
+              <span>Missed Notes: <strong className={evaluation.missed_notes_count ? "text-rose-400" : "text-emerald-400"}>{evaluation.missed_notes_count ?? 0}</strong></span>
+              <span>Extra Notes: <strong className={evaluation.extra_notes_count ? "text-amber-400" : "text-slate-400"}>{evaluation.extra_notes_count ?? 0}</strong></span>
+            </div>
+          )}
 
           {/* Actionable Musical Feedback */}
           <div className="space-y-2">

@@ -89,7 +89,7 @@ def compute_yin_pitch(
     if tau_chosen == -1:
         # Find global minimum in search range
         tau_chosen = min_tau + int(np.argmin(cmndf[min_tau:max_tau]))
-        if cmndf[tau_chosen] > 0.5:
+        if cmndf[tau_chosen] > 0.40:
             # Unvoiced / silence
             return 0.0, 0.0
 
