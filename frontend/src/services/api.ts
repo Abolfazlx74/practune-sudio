@@ -97,7 +97,8 @@ export async function evaluatePractice(
   referenceNotes: NoteItem[],
   performancePitches: PitchFrame[],
   toleranceCents = 50.0,
-  studioType: 'vocal' | 'instrument' = 'vocal'
+  studioType: 'vocal' | 'instrument' = 'vocal',
+  practiceMode: 'full' | 'note' = 'full'
 ): Promise<EvaluationResponse> {
   const res = await fetch(`${API_BASE}/practice/evaluate`, {
     method: 'POST',
@@ -107,6 +108,7 @@ export async function evaluatePractice(
       performance_pitches: performancePitches,
       tolerance_cents: toleranceCents,
       studio_type: studioType,
+      practice_mode: practiceMode,
     }),
   });
 

@@ -176,6 +176,8 @@ def evaluate_user_practice(request: EvaluationRequest):
         response = evaluate_performance(request)
         return response
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
 
 @app.post("/api/practice/evaluate-recording", response_model=EvaluationResponse)

@@ -302,6 +302,59 @@ def test_scenario_12_instrument_mode_transition_immunity():
     print(">>> PASS: Inter-note fluctuations and slides between notes successfully ignored in Instrument Mode.")
 
 
+def test_scenario_13_note_to_note_mode_evaluation():
+    """13. Note-to-Note Mode: Consolidates take as recorded file, extracts discrete note events and compares."""
+    notes, contour = load_demo_reference()
+    target_note = notes[0]  # First note
+    # Filter contour to roughly the first note's time window with realistic attack jitter
+    note_frames = [f for f in contour if target_note.start - 0.05 <= f.time <= target_note.end + 0.05]
+
+    req = EvaluationRequest(
+        reference_notes=[target_note],
+        performance_pitches=note_frames,
+        tolerance_cents=70.0,
+        studio_type="instrument",
+        practice_mode="note"
+    )
+    resp = evaluate_performance(req)
+
+    print("\n--- [TEST 13] Note-to-Note Extracted Note Evaluation ---")
+    print(f"Overall: {resp.overall_score}% | Pitch: {resp.pitch_accuracy}% | Timing: {resp.timing_accuracy}%")
+    print(f"Feedback: {resp.feedback}")
+    assert resp.overall_score >= 95.0, f"Expected score >= 95% in note-to-note mode, got {resp.overall_score}%"
+    assert resp.note_coverage == 100.0
+    assert len(resp.note_scores) == 1
+    assert resp.note_scores[0].is_hit is True
+    print(">>> PASS: Note-to-Note mode simplified recorded take into discrete note events and compared successfully.")
+
+
+def test_scenario_14_instrument_mode_missed_or_wrong_notes():
+    """14. Instrument Mode with Missed or Inaccurate Notes (Ensures no UnboundLocalError / 500 error)."""
+    notes, _ = load_demo_reference()
+    # Provide pitches for only the first note; remaining notes are missed
+    first_note = notes[0]
+    frames = [
+        PitchFrame(time=first_note.start + i * 0.02, frequency=first_note.frequency, midi=first_note.midi, confidence=0.9)
+        for i in range(12)
+    ]
+    req = EvaluationRequest(
+        reference_notes=notes,
+        performance_pitches=frames,
+        tolerance_cents=70.0,
+        studio_type="instrument",
+        practice_mode="full"
+    )
+    resp = evaluate_performance(req)
+
+    print("\n--- [TEST 14] Instrument Mode with Missed Notes ---")
+    print(f"Overall: {resp.overall_score}% | Pitch: {resp.pitch_accuracy}% | Missed: {resp.missed_notes_count}")
+    print(f"Feedback: {resp.feedback}")
+    assert resp.overall_score > 0.0
+    assert resp.missed_notes_count > 0
+    assert len(resp.feedback) > 0
+    print(">>> PASS: Instrument Mode evaluation with missed/off notes returns 200 OK without errors.")
+
+
 if __name__ == "__main__":
     print("=" * 65)
     print("PRACTUNE STUDIO AUDIO MATCHING & EVALUATION ACCURACY TEST SUITE")
@@ -318,6 +371,8 @@ if __name__ == "__main__":
     test_scenario_10_deterministic_reproducibility()
     test_scenario_11_instrument_mode_self_match()
     test_scenario_12_instrument_mode_transition_immunity()
+    test_scenario_13_note_to_note_mode_evaluation()
+    test_scenario_14_instrument_mode_missed_or_wrong_notes()
     print("\n" + "=" * 65)
-    print("ALL 12 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
+    print("ALL 14 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 65)

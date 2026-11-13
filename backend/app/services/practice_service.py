@@ -56,6 +56,76 @@ def extract_instrument_main_notes(notes: List[NoteItem]) -> List[NoteItem]:
 
     return merged
 
+def extract_notes_from_pitch_frames(frames: List[PitchFrame]) -> List[NoteItem]:
+    """
+    Transforms a performance pitch contour (from a recorded practice take)
+    into simplified, discrete musical note events.
+    Consolidates attack transients, vibrato, and pitch drift into the core played note.
+    """
+    from .pitch_transcription import midi_to_note_info
+    from .dsp_utils import midi_to_hz
+
+    if not frames:
+        return []
+
+    sorted_frames = sorted(frames, key=lambda f: f.time)
+    valid = [f for f in sorted_frames if f.confidence >= 0.35 and 50.0 <= f.frequency <= 2000.0]
+    if not valid:
+        return []
+
+    midis = [f.midi for f in valid]
+    smoothed_midis = []
+    for k in range(len(midis)):
+        win = midis[max(0, k - 1): min(len(midis), k + 2)]
+        smoothed_midis.append(float(np.median(win)))
+
+    notes: List[NoteItem] = []
+    curr_seg: List[PitchFrame] = []
+
+    def commit(seg: List[PitchFrame]):
+        if not seg:
+            return
+        seg_dur = seg[-1].time - seg[0].time
+        if seg_dur < 0.05:
+            return
+        seg_midis = [f.midi for f in seg]
+        med_m = float(np.median(seg_midis))
+        rounded_m = int(round(med_m))
+        n_name, octv, c_dev = midi_to_note_info(med_m)
+        freq = float(midi_to_hz(rounded_m))
+        conf = float(np.mean([f.confidence for f in seg]))
+        note_id = f"perf_{int(seg[0].time * 1000):06d}_{rounded_m}"
+        notes.append(NoteItem(
+            id=note_id,
+            midi=rounded_m,
+            note_name=n_name,
+            octave=octv,
+            start=round(seg[0].time, 3),
+            end=round(seg[-1].time, 3),
+            duration=round(max(0.04, seg_dur), 3),
+            confidence=round(conf, 2),
+            frequency=round(freq, 1),
+            cents_deviation=c_dev
+        ))
+
+    for idx, f in enumerate(valid):
+        if not curr_seg:
+            curr_seg.append(f)
+            continue
+        prev = curr_seg[-1]
+        dt = f.time - prev.time
+        dm = abs(smoothed_midis[idx] - smoothed_midis[idx - 1])
+        if dt > 0.090 or dm >= 0.80:
+            commit(curr_seg)
+            curr_seg = [f]
+        else:
+            curr_seg.append(f)
+
+    if curr_seg:
+        commit(curr_seg)
+
+    return extract_instrument_main_notes(notes)
+
 def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     """
     High-Precision Musical Performance Evaluator:
@@ -114,6 +184,151 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             extra_notes_count=0,
             alignment_offset_ms=0.0,
             avg_cents_error=0.0,
+            studio_type=studio_type
+        )
+
+    practice_mode = getattr(req, "practice_mode", "full") or "full"
+
+    # Dedicated Note-by-Note Evaluator (Treats take as recorded file, extracts discrete note events)
+    if practice_mode == "note" and len(ref_notes) == 1:
+        target_ref = ref_notes[0]
+        perf_notes = extract_notes_from_pitch_frames(valid_frames)
+
+        if not perf_notes:
+            feedback_msg = (
+                f"Target note {target_ref.note_name} was not detected. Check microphone volume and play the note clearly."
+                if studio_type == "instrument"
+                else f"Target note {target_ref.note_name} was not detected. Check microphone volume and sing the note clearly."
+            )
+            return EvaluationResponse(
+                pitch_accuracy=0.0,
+                timing_accuracy=0.0,
+                sequence_accuracy=0.0,
+                note_coverage=0.0,
+                overall_score=0.0,
+                feedback=[feedback_msg],
+                note_scores=[NoteScore(
+                    note_id=target_ref.id,
+                    target_note=target_ref.note_name,
+                    target_midi=target_ref.midi,
+                    start=target_ref.start,
+                    end=target_ref.end,
+                    user_avg_cents_error=100.0,
+                    user_detected_midi=None,
+                    is_hit=False,
+                    score=0.0
+                )],
+                detected_reference_notes_count=1,
+                detected_live_notes_count=0,
+                missed_notes_count=1,
+                extra_notes_count=0,
+                alignment_offset_ms=0.0,
+                avg_cents_error=0.0,
+                studio_type=studio_type
+            )
+
+        # Select best overlapping or closest candidate note
+        best_note = None
+        best_dist = float("inf")
+        for pn in perf_notes:
+            time_overlap = max(0.0, min(pn.end, target_ref.end) - max(pn.start, target_ref.start))
+            cents_d = abs(pn.midi - target_ref.midi)
+            dist = (abs(pn.start - target_ref.start) * 2.0) + cents_d - (time_overlap * 3.0)
+            if dist < best_dist:
+                best_dist = dist
+                best_note = pn
+
+        if best_note is None:
+            best_note = perf_notes[0]
+
+        # Compare target note vs extracted user note
+        ref_pitch = float(target_ref.midi) + (getattr(target_ref, "cents_deviation", 0.0) / 100.0)
+        user_pitch = float(best_note.midi) + (getattr(best_note, "cents_deviation", 0.0) / 100.0)
+
+        # Octave disambiguation
+        octave_shift = 0
+        diff_raw = user_pitch - ref_pitch
+        if abs(diff_raw - 12.0) <= 1.5:
+            user_pitch -= 12.0
+            octave_shift = 12
+        elif abs(diff_raw + 12.0) <= 1.5:
+            user_pitch += 12.0
+            octave_shift = -12
+
+        cents_err = (user_pitch - ref_pitch) * 100.0
+        semi_dist = abs(user_pitch - ref_pitch)
+        is_same_semitone = (round(user_pitch) == target_ref.midi) or (semi_dist <= 0.85)
+
+        if is_same_semitone:
+            is_hit = True
+            if abs(cents_err) <= 35.0:
+                pitch_score = 100.0
+            elif abs(cents_err) <= 80.0:
+                pitch_score = max(75.0, 100.0 - (abs(cents_err) - 35.0) * 0.55)
+            else:
+                pitch_score = max(55.0, 75.0 - (abs(cents_err) - 80.0) * 0.40)
+        else:
+            is_hit = False
+            pitch_score = max(0.0, 45.0 - (semi_dist - 0.85) * 20.0)
+
+        onset_diff_ms = abs(best_note.start - target_ref.start) * 1000.0
+        timing_score = max(40.0, 100.0 - max(0.0, onset_diff_ms - 80.0) / 2.0)
+
+        note_coverage = 100.0 if is_hit else 0.0
+        sequence_accuracy = 100.0 if is_hit else 0.0
+
+        overall = round(
+            0.40 * pitch_score
+            + 0.30 * timing_score
+            + 0.20 * note_coverage
+            + 0.10 * sequence_accuracy,
+            1
+        )
+        overall_score = max(0.0, min(100.0, overall))
+
+        note_total = round(0.70 * pitch_score + 0.30 * timing_score, 1)
+
+        note_scores = [NoteScore(
+            note_id=target_ref.id,
+            target_note=target_ref.note_name,
+            target_midi=target_ref.midi,
+            start=target_ref.start,
+            end=target_ref.end,
+            user_avg_cents_error=round(cents_err, 1),
+            user_detected_midi=round(user_pitch, 2),
+            is_hit=is_hit,
+            score=note_total
+        )]
+
+        feedback_items: List[str] = []
+        if is_hit:
+            feedback_items.append(f"Excellent hit! Extracted {best_note.note_name} ({abs(cents_err):.0f}¢ dev, {best_note.duration:.2f}s sustain).")
+            if onset_diff_ms <= 80.0:
+                feedback_items.append("Spot-on onset attack timing!")
+            else:
+                feedback_items.append(f"Attack timing entered ~{onset_diff_ms:.0f}ms from target.")
+        else:
+            feedback_items.append(f"Detected note {best_note.note_name} ({best_note.frequency:.1f}Hz) instead of target {target_ref.note_name}.")
+            feedback_items.append(f"Pitch was {semi_dist:.1f} semitones off. Focus on hitting {target_ref.note_name}.")
+
+        if octave_shift != 0:
+            feedback_items.append(f"Octave shift: played 1 octave {'higher' if octave_shift > 0 else 'lower'}.")
+
+        return EvaluationResponse(
+            pitch_accuracy=round(pitch_score, 1),
+            timing_accuracy=round(timing_score, 1),
+            sequence_accuracy=sequence_accuracy,
+            note_coverage=note_coverage,
+            overall_score=overall_score,
+            feedback=feedback_items,
+            note_scores=note_scores,
+            detected_reference_notes_count=1,
+            detected_live_notes_count=1,
+            missed_notes_count=0 if is_hit else 1,
+            extra_notes_count=max(0, len(perf_notes) - 1),
+            alignment_offset_ms=round((best_note.start - target_ref.start) * 1000.0, 1),
+            avg_cents_error=round(abs(cents_err), 1),
+            evaluation_mode=getattr(req, "evaluation_mode", "live"),
             studio_type=studio_type
         )
 
@@ -256,6 +471,7 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
         stable_core_midis = []
         transitions = getattr(req, "transitions", None) or []
         dur = note.end - note.start
+        eff_tolerance = max(tol_cents, 70.0 if studio_type == "instrument" else 55.0)
 
         if studio_type == "instrument":
             # Instrument Mode: Isolate stable body of the note, excluding attack/release transients & transition slides

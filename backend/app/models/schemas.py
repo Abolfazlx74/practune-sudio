@@ -96,6 +96,7 @@ class EvaluationRequest(BaseModel):
     transitions: Optional[List[TransitionRegion]] = []
     evaluation_mode: str = "live"  # "live" or "imported"
     studio_type: str = "vocal"  # "vocal" or "instrument"
+    practice_mode: str = "full"  # "full" or "note"
 
 class EvaluationResponse(BaseModel):
     pitch_accuracy: float

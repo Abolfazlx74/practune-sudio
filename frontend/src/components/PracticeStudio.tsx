@@ -518,7 +518,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           ? [selectedNote]
           : effectiveNotes;
       const tolerance = studioType === 'vocal' ? 60.0 : 70.0;
-      const resp = await evaluatePractice(evalTargetNotes, recordedPitches, tolerance, studioType);
+      const resp = await evaluatePractice(evalTargetNotes, recordedPitches, tolerance, studioType, practiceMode);
       setEvaluation(resp);
 
       const currentSettings: PracticeConfigSettings = {
