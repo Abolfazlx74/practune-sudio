@@ -23,6 +23,7 @@ import { PianoRoll } from './PianoRoll';
 import { SheetMusicView } from './SheetMusicView';
 import { PitchTimeline } from './PitchTimeline';
 import { PitchCorrectionControls } from './PitchCorrectionControls';
+import { SmartMetronome } from './SmartMetronome';
 
 interface VisualizationHubProps {
   transcription: TranscriptionResult;
@@ -365,6 +366,16 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Smart Beat-Synced Metronome */}
+      <SmartMetronome
+        detectedBpm={transcription.bpm}
+        firstBeatTime={transcription.notes[0]?.start ?? 0}
+        isPlaying={isPlaying}
+        currentTime={currentTime}
+        playbackSpeed={playbackSpeed}
+        defaultEnabled={false}
+      />
 
       {/* View Sub-Tabs (Piano Roll / Sheet Music / Pitch Timeline) */}
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2">

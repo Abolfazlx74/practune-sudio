@@ -18,17 +18,18 @@ import {
   EyeOff,
   Mic2,
   Piano,
-  Upload,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
 import type { LivePitchData } from '../services/micPitchTracker';
-import { getAudioFileUrl, evaluatePractice, evaluateRecordedPerformance } from '../services/api';
+import { getAudioFileUrl, evaluatePractice } from '../services/api';
 import { synth } from '../services/synth';
 import { recordPracticeSession } from '../services/historyService';
 import { recordPerformanceToProject } from '../services/projectService';
 import { EvaluationModal } from './EvaluationModal';
 import { SmartHistoryModal } from './SmartHistoryModal';
+import { SmartMetronome } from './SmartMetronome';
+import type { MetronomeGridState } from './SmartMetronome';
 
 interface PracticeStudioProps {
   transcription: TranscriptionResult;
@@ -62,14 +63,20 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [livePitch, setLivePitch] = useState<LivePitchData | null>(null);
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
-  const [isImporting, setIsImporting] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  // Studio Domain Mode (Vocal vs Instrument) & Blind Memory Mode
+  // Studio Domain Mode (Vocal/Quran vs Instrument) & Blind Memory Mode
   const [studioType, setStudioType] = useState<'vocal' | 'instrument'>('vocal');
   const [blindMode, setBlindMode] = useState<boolean>(false);
   const [showPostBlindAnalysis, setShowPostBlindAnalysis] = useState<boolean>(false);
+
+  // Metronome visual grid state
+  const [metronomeGrid, setMetronomeGrid] = useState<MetronomeGridState>({
+    enabled: false,
+    bpm: transcription.bpm || 120,
+    timeSignature: '4/4',
+    anchorTime: transcription.notes[0]?.start ?? 0,
+  });
 
   // Pre-Practice Countdown Timer (Enabled by default, 3s default, customizable)
   const [countdownEnabled, setCountdownEnabled] = useState<boolean>(true);
@@ -94,7 +101,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const recentMicMidisRef = useRef<number[]>([]);
   const smoothedMidiRef = useRef<number | null>(null);
   const animRef = useRef<number | null>(null);
-  const isStoppingRef = useRef<boolean>(false);
 
   // Sync mute state with reference audio element
   useEffect(() => {
@@ -117,56 +123,14 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
   };
 
-  // Transpose notes for practice if user changes key
-  const transposedNotes: NoteItem[] = React.useMemo(() => {
-    return transcription.notes.map((n) => {
-      const newMidi = n.midi + transposeSemitones;
-      const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-      // FL Studio standard: MIDI 60 is C5, MIDI 69 is A5 (440Hz), MIDI 70 is A#5
-      const octave = Math.floor(newMidi / 12);
-      const name = `${NOTE_NAMES[((newMidi % 12) + 12) % 12]}${octave}`;
-      const newFreq = 440 * Math.pow(2, (newMidi - 69) / 12);
-      return { ...n, midi: newMidi, note_name: name, frequency: Math.round(newFreq * 10) / 10 };
-    });
-  }, [transcription.notes, transposeSemitones]);
-
-  // In Instrument Mode: isolate clean main notes, filtering out transition micro-glitches (< 90ms)
-  const effectiveNotes: NoteItem[] = React.useMemo(() => {
-    if (studioType !== 'instrument') {
-      return transposedNotes;
-    }
-    const clean: NoteItem[] = [];
-    for (let i = 0; i < transposedNotes.length; i++) {
-      const n = transposedNotes[i];
-      const dur = n.end - n.start;
-      if (dur < 0.09 && transposedNotes.length > 1) {
-        const prev = i > 0 ? transposedNotes[i - 1] : null;
-        const next = i < transposedNotes.length - 1 ? transposedNotes[i + 1] : null;
-        if (prev && next && Math.abs(prev.midi - next.midi) >= 1) {
-          continue; // inter-note slide / glitch
-        }
-        if (dur < 0.07) continue;
-      }
-      clean.push(n);
-    }
-    const candidates = clean.length > 0 ? clean : transposedNotes;
-    // Merge consecutive split notes of same pitch with tiny rest (< 100ms)
-    const merged: NoteItem[] = [];
-    for (const n of candidates) {
-      if (merged.length === 0) {
-        merged.push({ ...n });
-        continue;
-      }
-      const last = merged[merged.length - 1];
-      if (last.midi === n.midi && (n.start - last.end) < 0.10) {
-        last.end = n.end;
-        last.duration = Math.round((last.end - last.start) * 1000) / 1000;
-      } else {
-        merged.push({ ...n });
-      }
-    }
-    return merged;
-  }, [transposedNotes, studioType]);
+  // Transpose notes for practice if user changes key (FL Studio octave convention: MIDI 60 = C5)
+  const effectiveNotes: NoteItem[] = transcription.notes.map((n) => {
+    const newMidi = n.midi + transposeSemitones;
+    const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const octave = Math.floor(newMidi / 12);
+    const name = `${NOTE_NAMES[((newMidi % 12) + 12) % 12]}${octave}`;
+    return { ...n, midi: newMidi, octave, note_name: name };
+  });
 
   // De-spiked & Smoothed Continuous F0 Contour (9-point Median Filter + Gaussian Smooth)
   const rawContour: PitchFrame[] = React.useMemo(() => {
@@ -231,15 +195,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   // Helper to get reference MIDI at any timestamp
   const getTargetMidiAtTime = (t: number): number | null => {
-    // 1. Direct matching with musical note plateaus (prevents transition glitches from skewing target)
-    const refNote = practiceMode === 'note' && selectedNote
-      ? selectedNote
-      : effectiveNotes.find((n) => t >= n.start - 0.03 && t <= n.end + 0.03);
-    if (refNote) {
-      return refNote.midi;
-    }
-
-    // 2. Continuous contour interpolation during valid inter-note slides
     if (studioType === 'vocal' && rawContour.length > 0) {
       let lo = 0;
       let hi = rawContour.length - 1;
@@ -252,16 +207,18 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       const p1 = lo > 0 ? rawContour[lo - 1] : p2;
 
       if (p1 && p2 && p1.midi > 0 && p2.midi > 0 && p2.time - p1.time <= 0.15 && p2.time > p1.time) {
-        if (Math.abs(p2.midi - p1.midi) <= 6.0) {
-          const ratio = Math.max(0, Math.min(1, (t - p1.time) / (p2.time - p1.time)));
-          return p1.midi + (p2.midi - p1.midi) * ratio;
-        }
+        const ratio = Math.max(0, Math.min(1, (t - p1.time) / (p2.time - p1.time)));
+        return p1.midi + (p2.midi - p1.midi) * ratio;
       }
-      if (p2 && p2.midi > 0 && Math.abs(p2.time - t) <= 0.10) {
+      if (p2 && p2.midi > 0 && Math.abs(p2.time - t) <= 0.12) {
         return p2.midi;
       }
+      return null;
     }
-    return null;
+    const refNote = practiceMode === 'note' && selectedNote
+      ? selectedNote
+      : effectiveNotes.find((n) => t >= n.start && t <= n.end);
+    return refNote ? refNote.midi : null;
   };
 
   // Check if a sung MIDI matches the reference contour within a ±0.20s window
@@ -283,12 +240,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       return false;
     }
     const targetMidi = getTargetMidiAtTime(t);
-    if (targetMidi === null) return false;
-    const diff = Math.abs(userMidi - targetMidi);
-    return diff <= 0.85 || Math.round(userMidi) === Math.round(targetMidi);
+    return targetMidi !== null && Math.abs(userMidi - targetMidi) <= 0.65;
   };
 
-  // Fast median despiker with octave lock (zero phase-delay lag on note transitions)
+  // Multi-stage Mic Stabilizer: Median Despike + Octave Lock + Smooth EMA
   const stabilizeUserMidi = (rawMidi: number, timestamp: number): number => {
     let corrected = rawMidi;
     const refMidi = getTargetMidiAtTime(timestamp);
@@ -296,13 +251,23 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     if (refMidi !== null) {
       if (Math.abs((corrected - 12) - refMidi) <= 1.6) corrected -= 12;
       else if (Math.abs((corrected + 12) - refMidi) <= 1.6) corrected += 12;
+    } else if (smoothedMidiRef.current !== null) {
+      if (Math.abs((corrected - 12) - smoothedMidiRef.current) <= 1.6) corrected -= 12;
+      else if (Math.abs((corrected + 12) - smoothedMidiRef.current) <= 1.6) corrected += 12;
     }
 
     const buf = recentMicMidisRef.current;
     buf.push(corrected);
-    if (buf.length > 3) buf.shift();
+    if (buf.length > 5) buf.shift();
     const sorted = [...buf].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length / 2)];
+    const medianMidi = sorted[Math.floor(sorted.length / 2)];
+
+    if (smoothedMidiRef.current === null || Math.abs(medianMidi - smoothedMidiRef.current) > 6) {
+      smoothedMidiRef.current = medianMidi;
+    } else {
+      smoothedMidiRef.current = smoothedMidiRef.current * 0.65 + medianMidi * 0.35;
+    }
+    return smoothedMidiRef.current;
   };
 
   const duration = transcription.duration || 10;
@@ -391,7 +356,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   // Actual execution of practice session
   const executeStartPractice = async () => {
     try {
-      isStoppingRef.current = false;
       userPitchHistory.current = [];
       livePitchRef.current = null;
       recentMicMidisRef.current = [];
@@ -403,14 +367,15 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       await tracker.start((data) => {
         if (data.isVoiced && audioRef.current) {
           const rawTime = audioRef.current.currentTime;
-          const exactTime = Math.max(0, Math.round(rawTime * 1000) / 1000);
-          const cleanMidi = stabilizeUserMidi(data.midi, exactTime);
+          // Compensate ~150ms round-trip audio/DSP latency
+          const alignedTime = Math.max(0, Math.round((rawTime - 0.15) * 1000) / 1000);
+          const cleanMidi = stabilizeUserMidi(data.midi, alignedTime);
           const stabilizedData: LivePitchData = { ...data, midi: cleanMidi };
           livePitchRef.current = stabilizedData;
           setLivePitch(stabilizedData);
 
           userPitchHistory.current.push({
-            time: exactTime,
+            time: alignedTime,
             frequency: 440 * Math.pow(2, (cleanMidi - 69) / 12),
             midi: cleanMidi,
             confidence: data.confidence,
@@ -446,53 +411,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
   };
 
-  // Build continuous contour phrase segments cloning NoteItem schema types (integer id & midi)
-  const buildVocalReferenceSegments = (): NoteItem[] => {
-    if (rawContour.length === 0 || effectiveNotes.length === 0) return effectiveNotes;
-    const template = effectiveNotes[0];
-    const segments: NoteItem[] = [];
-    let segStart = -1;
-    let segMidis: number[] = [];
-
-    for (let i = 0; i < rawContour.length; i++) {
-      const pt = rawContour[i];
-      const prev = i > 0 ? rawContour[i - 1] : null;
-      const isBreak = pt.midi <= 0 || (prev && prev.midi > 0 && pt.time - prev.time > 0.2);
-
-      if (isBreak) {
-        if (segStart >= 0 && segMidis.length >= 3) {
-          const endT = prev ? prev.time : segStart + 0.1;
-          const sorted = [...segMidis].sort((a, b) => a - b);
-          const medMidi = sorted[Math.floor(sorted.length / 2)];
-          const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-          const rMidi = Math.round(medMidi);
-          const octave = Math.floor(rMidi / 12);
-          const segId = typeof template.id === 'number' ? segments.length + 1 : `vocal_seg_${segments.length}`;
-          segments.push({
-            ...template,
-            id: segId as any,
-            note_name: `${NOTE_NAMES[((rMidi % 12) + 12) % 12]}${octave}`,
-            midi: rMidi,
-            frequency: Math.round(440 * Math.pow(2, (medMidi - 69) / 12) * 100) / 100,
-            start: Math.round(segStart * 1000) / 1000,
-            end: Math.round(endT * 1000) / 1000,
-            duration: Math.max(0.1, Math.round((endT - segStart) * 1000) / 1000),
-            cents_deviation: Math.round((medMidi - rMidi) * 1000) / 10,
-            confidence: 0.95,
-          });
-        }
-        segStart = -1;
-        segMidis = [];
-      }
-
-      if (pt.midi > 0) {
-        if (segStart < 0) segStart = pt.time;
-        segMidis.push(pt.midi);
-      }
-    }
-    return segments.length > 0 ? segments : effectiveNotes;
-  };
-
   const stopPracticeSession = async () => {
     cancelCountdown();
     if (trackerRef.current) {
@@ -510,97 +428,51 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setShowPostBlindAnalysis(true);
     }
 
-    const recordedPitches = [...userPitchHistory.current];
-    setIsEvaluating(true);
-    try {
-      const evalTargetNotes =
-        practiceMode === 'note' && selectedNote
-          ? [selectedNote]
-          : effectiveNotes;
-      const tolerance = studioType === 'vocal' ? 60.0 : 70.0;
-      const resp = await evaluatePractice(evalTargetNotes, recordedPitches, tolerance, studioType, practiceMode);
-      setEvaluation(resp);
+    if (userPitchHistory.current.length > 0) {
+      setIsEvaluating(true);
+      try {
+        const evalTargetNotes =
+          practiceMode === 'note' && selectedNote
+            ? [selectedNote]
+            : effectiveNotes;
+        const tolerance = studioType === 'instrument' ? 70.0 : 55.0;
+        const resp = await evaluatePractice(
+          evalTargetNotes,
+          userPitchHistory.current,
+          tolerance,
+          studioType,
+          practiceMode
+        );
+        setEvaluation(resp);
 
-      const currentSettings: PracticeConfigSettings = {
-        mode: practiceMode,
-        target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
-        target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
-        playback_speed: playbackSpeed,
-        transpose_semitones: transposeSemitones,
-        tolerance_cents: tolerance,
-      };
+        const currentSettings: PracticeConfigSettings = {
+          mode: practiceMode,
+          target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
+          target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
+          playback_speed: playbackSpeed,
+          transpose_semitones: transposeSemitones,
+          tolerance_cents: tolerance,
+        };
 
-      const sessionAudio = audioInfo || {
-        id: audioId,
-        filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
-        duration: duration,
-      };
+        const sessionAudio = audioInfo || {
+          id: audioId,
+          filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
+          duration: duration,
+        };
 
-      recordPracticeSession(sessionAudio, currentSettings, resp);
-      await recordPerformanceToProject(
-        currentProjectId || audioId,
-        sessionAudio,
-        currentSettings,
-        resp
-      );
-      onPracticeModified?.();
-    } catch (err: any) {
-      console.error('Evaluation error:', err?.message || JSON.stringify(err));
-    } finally {
-      setIsEvaluating(false);
-      isStoppingRef.current = false;
-    }
-  };
-
-  const handleImportPerformanceClick = () => {
-    if (fileInputRef.current) {
-      fileInputRef.current.value = '';
-      fileInputRef.current.click();
-    }
-  };
-
-  const handlePerformanceFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setIsImporting(true);
-    try {
-      const tolerance = studioType === 'vocal' ? 60.0 : 70.0;
-      const resp = await evaluateRecordedPerformance(audioId, file, tolerance, transposeSemitones, studioType);
-
-      if (resp.performance_contour && resp.performance_contour.length > 0) {
-        userPitchHistory.current = resp.performance_contour;
+        recordPracticeSession(sessionAudio, currentSettings, resp);
+        await recordPerformanceToProject(
+          currentProjectId || audioId,
+          sessionAudio,
+          currentSettings,
+          resp
+        );
+        onPracticeModified?.();
+      } catch (err: any) {
+        console.error('Evaluation error:', err?.message || JSON.stringify(err));
+      } finally {
+        setIsEvaluating(false);
       }
-      setEvaluation(resp);
-
-      const currentSettings: PracticeConfigSettings = {
-        mode: practiceMode,
-        target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
-        target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
-        playback_speed: playbackSpeed,
-        transpose_semitones: transposeSemitones,
-        tolerance_cents: tolerance,
-      };
-
-      const sessionAudio = audioInfo || {
-        id: audioId,
-        filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
-        duration: duration,
-      };
-
-      recordPracticeSession(sessionAudio, currentSettings, resp);
-      await recordPerformanceToProject(
-        currentProjectId || audioId,
-        sessionAudio,
-        currentSettings,
-        resp
-      );
-      onPracticeModified?.();
-      drawPracticeCanvas();
-    } catch (err: any) {
-      alert(`Performance evaluation failed: ${err.message || 'Error evaluating audio file'}`);
-    } finally {
-      setIsImporting(false);
     }
   };
 
@@ -622,7 +494,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     currentTime: number,
     history: PitchFrame[]
   ): boolean => {
-    // NEVER light up points ahead of the playhead (future timeline must stay dim until reached!)
     if (t > currentTime) return false;
     if (history.length === 0) return false;
 
@@ -641,6 +512,46 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       }
     }
     return false;
+  };
+
+  // Helper to render subtle vertical metronome beat grid lines on the scrolling canvas
+  const drawMetronomeBeatGrid = (
+    ctx: CanvasRenderingContext2D,
+    timeToX: (t: number) => number,
+    leftMargin: number,
+    width: number,
+    axisY: number
+  ) => {
+    if (!metronomeGrid.enabled || metronomeGrid.bpm <= 0) return;
+    const beatDur = 60.0 / metronomeGrid.bpm;
+    const beatsPerBar =
+      metronomeGrid.timeSignature === '3/4'
+        ? 3
+        : metronomeGrid.timeSignature === '6/8'
+        ? 6
+        : metronomeGrid.timeSignature === '2/4'
+        ? 2
+        : 4;
+
+    let beatIdx = 0;
+    for (let t = metronomeGrid.anchorTime; t <= duration; t += beatDur) {
+      const bx = timeToX(t);
+      if (bx >= leftMargin && bx <= width) {
+        const isDownbeat = beatIdx % beatsPerBar === 0;
+        ctx.save();
+        ctx.strokeStyle = isDownbeat
+          ? 'rgba(251, 191, 36, 0.22)'
+          : 'rgba(148, 163, 184, 0.10)';
+        ctx.lineWidth = isDownbeat ? 1.5 : 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(bx, 22);
+        ctx.lineTo(bx, axisY);
+        ctx.stroke();
+        ctx.restore();
+      }
+      beatIdx++;
+    }
   };
 
   const drawPracticeCanvas = () => {
@@ -671,18 +582,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       if (currentTime >= loopEnd) {
         audioRef.current.currentTime = loopStart;
       }
-    } else if (isPracticing && !isStoppingRef.current && practiceMode === 'note' && selectedNote && !loopNote) {
-      // Single note practice without looping: complete session when note ends
-      if (currentTime >= selectedNote.end + 0.25) {
-        isStoppingRef.current = true;
-        stopPracticeSession();
-      }
-    } else if (isPracticing && !isStoppingRef.current && practiceMode === 'full' && audioRef.current) {
-      // Full practice watchdog: auto-complete if playback reached the end
-      if (audioRef.current.ended || (duration > 0 && currentTime >= duration - 0.08)) {
-        isStoppingRef.current = true;
-        stopPracticeSession();
-      }
     }
 
     // Smoothly update digital clock display
@@ -703,7 +602,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const hideReferenceGraph = blindMode && isPracticing;
 
     // =========================================================================
-    // VOCAL  MODE: Zoomed Scrolling Timeline with Centered Fixed Playhead
+    // VOCAL / QURAN MODE: Zoomed Scrolling Timeline with Centered Fixed Playhead
     // =========================================================================
     if (studioType === 'vocal') {
       const leftMargin = 38;
@@ -736,9 +635,12 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       ctx.rect(leftMargin, 0, plotWidth, axisY);
       ctx.clip();
 
+      // Optional Metronome Beat Grid Lines
+      drawMetronomeBeatGrid(ctx, timeToX, leftMargin, width, axisY);
+
       const history = userPitchHistory.current;
 
-      // 2. Single Main Reference Vocal Contour (Dim Neon Green ahead -> Bright Neon Green ONLY behind playhead when matched)
+      // 2. Single Main Reference Vocal Contour
       if (!hideReferenceGraph && rawContour.length > 1) {
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
@@ -747,11 +649,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           const p1 = rawContour[i - 1];
           const p2 = rawContour[i];
           if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.18) continue;
-
-          // Prevent drawing vertical plummeting artifact lines across sudden sub-harmonic octave drops
-          const dt = p2.time - p1.time;
-          const dm = Math.abs(p2.midi - p1.midi);
-          if (dm > 5.5 && dt < 0.05) continue;
 
           const x1 = timeToX(p1.time);
           const x2 = timeToX(p2.time);
@@ -799,7 +696,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         ctx.textAlign = 'left';
       }
 
-      // 3. Off-Pitch User Trace (Drawn smoothly in Red ONLY behind playhead where user sings genuinely off-pitch)
+      // 3. Off-Pitch User Trace
       if (history.length > 1) {
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
@@ -807,7 +704,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         for (let i = 1; i < history.length; i++) {
           const p1 = history[i - 1];
           const p2 = history[i];
-          if (p2.time - p1.time > 0.18 || p2.time > currentTime || (Math.abs(p2.midi - p1.midi) > 6.0 && p2.time - p1.time < 0.05)) continue;
+          if (p2.time - p1.time > 0.18 || p2.time > currentTime) continue;
 
           const x1 = timeToX(p1.time);
           const x2 = timeToX(p2.time);
@@ -958,6 +855,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     ctx.rect(leftMargin, 0, plotWidth, axisY);
     ctx.clip();
 
+    // Optional Metronome Beat Grid Lines
+    drawMetronomeBeatGrid(ctx, timeToX, leftMargin, width, axisY);
+
     // 2. Incoming Note Blocks Scrolling Toward the Gate
     const currentLive = livePitchRef.current;
     let activeGateNote: NoteItem | null = null;
@@ -1008,58 +908,52 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       });
     }
 
-    // 3. Linear Timeline Playhead (حالت خطی)
-    let lineStroke = 'rgba(56, 189, 248, 0.45)';
-    let lineGlow = 'transparent';
+    // 3. Rectangular Gate Pointer
+    let gateStroke = 'rgba(148, 163, 184, 0.55)';
+    let gateFill = 'rgba(148, 163, 184, 0.07)';
+    let gateGlow = 'transparent';
 
     if (isPracticing && currentLive?.isVoiced) {
       const targetNote = practiceMode === 'note' && selectedNote ? selectedNote : activeGateNote;
       if (targetNote) {
-        const semitoneDiff = Math.abs(currentLive.midi - targetNote.midi);
-        const isCorrectNote = semitoneDiff <= 0.85 || Math.round(currentLive.midi) === targetNote.midi;
+        const isCorrectNote = Math.abs(currentLive.midi - targetNote.midi) <= 0.65;
         if (isCorrectNote) {
-          lineStroke = '#39ff14';
-          lineGlow = '#39ff14';
+          gateStroke = '#39ff14';
+          gateFill = 'rgba(57, 255, 20, 0.16)';
+          gateGlow = '#39ff14';
         } else {
-          lineStroke = '#ef4444';
-          lineGlow = '#ef4444';
+          gateStroke = '#ef4444';
+          gateFill = 'rgba(239, 68, 68, 0.22)';
+          gateGlow = '#ef4444';
         }
       } else {
-        // In inter-note gaps / transitions: keep line neutral
-        lineStroke = 'rgba(148, 163, 184, 0.55)';
-        lineGlow = 'transparent';
+        gateStroke = '#ef4444';
+        gateFill = 'rgba(239, 68, 68, 0.16)';
+        gateGlow = '#ef4444';
       }
     }
 
-    // Sleek Linear Timeline Playhead Line (حالت خطی)
     ctx.save();
-    ctx.strokeStyle = lineStroke;
-    ctx.lineWidth = isPracticing && currentLive?.isVoiced ? 2.5 : 1.8;
-    if (lineGlow !== 'transparent') {
-      ctx.shadowColor = lineGlow;
-      ctx.shadowBlur = 14;
+    ctx.fillStyle = gateFill;
+    ctx.strokeStyle = gateStroke;
+    ctx.lineWidth = 2.5;
+    if (gateGlow !== 'transparent') {
+      ctx.shadowColor = gateGlow;
+      ctx.shadowBlur = 16;
     }
     ctx.beginPath();
-    ctx.moveTo(gateX, 0);
-    ctx.lineTo(gateX, axisY);
+    ctx.roundRect(gateX - gateWidth / 2, 24, gateWidth, axisY - 28, 6);
+    ctx.fill();
     ctx.stroke();
     ctx.restore();
 
-    // Live Note Hit / Pointer Indicator at the Linear Timeline
     if (isPracticing && currentLive?.isVoiced) {
       const clampedMidi = Math.max(minMidi, Math.min(maxMidi, currentLive.midi));
       const userGateY = midiToY(clampedMidi) + 9;
-      ctx.save();
-      ctx.fillStyle = lineStroke;
-      ctx.shadowColor = lineStroke;
-      ctx.shadowBlur = 14;
+      ctx.fillStyle = gateStroke;
       ctx.beginPath();
-      ctx.arc(gateX, userGateY, 6, 0, Math.PI * 2);
+      ctx.roundRect(gateX - gateWidth / 2 + 2, userGateY - 5, gateWidth - 4, 10, 3);
       ctx.fill();
-      ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 1.8;
-      ctx.stroke();
-      ctx.restore();
     }
 
     ctx.restore();
@@ -1098,7 +992,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const badgeY = 4;
 
     ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-    ctx.strokeStyle = lineStroke;
+    ctx.strokeStyle = gateStroke;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
@@ -1111,7 +1005,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   useEffect(() => {
     drawPracticeCanvas();
-  }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, selectedNoteIndex, studioType, blindMode, showPostBlindAnalysis]);
+  }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, selectedNoteIndex, studioType, blindMode, showPostBlindAnalysis, metronomeGrid]);
 
   // Click directly on canvas to select and audition a note
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1163,22 +1057,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       <audio
         ref={audioRef}
         src={getAudioFileUrl(audioId)}
-        onEnded={() => {
-          if (!isStoppingRef.current) {
-            isStoppingRef.current = true;
-            stopPracticeSession();
-          }
-        }}
-        onTimeUpdate={(e) => {
-          const ct = e.currentTarget.currentTime;
-          setCurrentTimeDisplay(ct);
-          if (isPracticing && !isStoppingRef.current && practiceMode === 'full' && duration > 0) {
-            if (e.currentTarget.ended || ct >= duration - 0.08) {
-              isStoppingRef.current = true;
-              stopPracticeSession();
-            }
-          }
-        }}
+        onEnded={stopPracticeSession}
+        onTimeUpdate={(e) => setCurrentTimeDisplay(e.currentTarget.currentTime)}
         preload="auto"
         muted={isMuted}
       />
@@ -1249,7 +1129,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
             </button>
 
-            {/* Start / Finish Action Button & Imported Performance Option */}
+            {/* Start / Finish Action Button */}
             {!isPracticing ? (
               countdownValue !== null ? (
                 <button
@@ -1260,31 +1140,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                   Starting in {countdownValue}s... (Cancel)
                 </button>
               ) : (
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={handleStartPracticeClick}
-                    className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
-                  >
-                    <Play className="w-4 h-4 fill-current ml-0.5" />
-                    {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
-                  </button>
-                  <button
-                    onClick={handleImportPerformanceClick}
-                    disabled={isImporting}
-                    className="flex items-center gap-2 px-4 py-2.5 bg-slate-900 border border-slate-700/80 hover:border-slate-600 hover:bg-slate-800 text-slate-200 font-semibold rounded-xl text-sm shadow-sm transition-all"
-                    title="Import an audio recording of your performance to evaluate against reference"
-                  >
-                    <Upload className="w-4 h-4 text-cyan-400" />
-                    {isImporting ? 'Analyzing Take...' : 'Import Performance'}
-                  </button>
-                  <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={handlePerformanceFileChange}
-                    accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a"
-                    className="hidden"
-                  />
-                </div>
+                <button
+                  onClick={handleStartPracticeClick}
+                  className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
+                >
+                  <Play className="w-4 h-4 fill-current ml-0.5" />
+                  {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
+                </button>
               )
             ) : (
               <button
@@ -1298,10 +1160,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           </div>
         </div>
 
-        {/* Practice Mode Switcher (Vocal vs Instrument + Full Song vs Note-by-Note + Blind Mode) */}
+        {/* Practice Mode Switcher (Vocal/Quran vs Instrument + Full Song vs Note-by-Note + Blind Mode) */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
           <div className="flex flex-wrap items-center gap-2">
-            {/* Domain Mode: Vocal vs Instrument */}
+            {/* Domain Mode: Vocal/Quran vs Instrument */}
             <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
               <button
                 onClick={() => setStudioType('vocal')}
@@ -1312,7 +1174,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 }`}
               >
                 <Mic2 className="w-3.5 h-3.5" />
-                <span>Vocal</span>
+                <span>Vocal / Quran</span>
               </button>
               <button
                 onClick={() => setStudioType('instrument')}
@@ -1390,120 +1252,110 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
         {/* Note-by-Note Dedicated Control Toolbar */}
         {practiceMode === 'note' && (
-          <div
-            className="p-3.5 rounded-xl bg-slate-950/80 flex flex-col gap-2.5 w-full"
-            style={{ border: 'none' }}
-          >
-            {/* Top Row: Note Stepping & Audition Controls */}
-            <div className="flex flex-wrap items-center justify-between gap-2.5 w-full">
-              {/* Note Stepping & Audition */}
-              <div className="flex flex-wrap items-center gap-2">
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => {
-                      const nextIdx = Math.max(0, selectedNoteIndex - 1);
-                      setSelectedNoteIndex(nextIdx);
-                      const note = effectiveNotes[nextIdx];
-                      if (note) {
-                        synth.playMidiNote(note.midi, 0.4);
-                        if (audioRef.current && !isPracticing) {
-                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                          setCurrentTimeDisplay(audioRef.current.currentTime);
-                        }
-                      }
-                    }}
-                    disabled={selectedNoteIndex <= 0}
-                    className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                    title="Previous Note (←)"
-                  >
-                    <ChevronLeft className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      const nextIdx = Math.min(effectiveNotes.length - 1, selectedNoteIndex + 1);
-                      setSelectedNoteIndex(nextIdx);
-                      const note = effectiveNotes[nextIdx];
-                      if (note) {
-                        synth.playMidiNote(note.midi, 0.4);
-                        if (audioRef.current && !isPracticing) {
-                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                          setCurrentTimeDisplay(audioRef.current.currentTime);
-                        }
-                      }
-                    }}
-                    disabled={selectedNoteIndex >= effectiveNotes.length - 1}
-                    className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                    title="Next Note (→)"
-                  >
-                    <ChevronRight className="w-4 h-4" />
-                  </button>
-                </div>
-
-                {/* Target Note Badge */}
-                {selectedNote && (
-                  <div className="flex items-center gap-2 px-3 py-1 bg-amber-950/40 border border-amber-500/40 rounded-xl">
-                    <Target className="w-4 h-4 text-amber-400" />
-                    <span className="text-xs text-slate-400">Target Note {selectedNoteIndex + 1}/{effectiveNotes.length}:</span>
-                    <strong className="text-sm font-mono font-bold text-amber-300">{selectedNote.note_name}</strong>
-                    <span className="text-xs text-slate-400 font-mono">({selectedNote.frequency.toFixed(1)} Hz)</span>
-                    <span className="text-xs text-slate-500 font-mono">[{selectedNote.start.toFixed(2)}s - {selectedNote.end.toFixed(2)}s]</span>
-                  </div>
-                )}
-              </div>
-
-              {/* Action Buttons: Hear Pitch & Loop Note */}
-              <div className="flex items-center gap-2">
-                {selectedNote && (
-                  <button
-                    onClick={() => synth.playMidiNote(selectedNote.midi, 0.6)}
-                    className="flex items-center gap-1.5 px-3 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-cyan-300 transition-all"
-                    title="Hear target note pitch with reference synth"
-                  >
-                    <Volume2 className="w-3.5 h-3.5" />
-                    <span>Hear Pitch</span>
-                  </button>
-                )}
-
+          <div className="p-3.5 rounded-xl bg-slate-950/90 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3">
+            {/* Note Stepping & Audition */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1">
                 <button
-                  onClick={() => setLoopNote((prev) => !prev)}
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
-                    loopNote
-                      ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
-                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                  }`}
-                  title="Loop playback on this specific note"
-                >
-                  <Repeat className="w-3.5 h-3.5" />
-                  <span>Loop Note</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Bottom Row: Quick Note Selector Carousel (Always starts on its own line) */}
-            <div className="w-full">
-              <div className="flex items-center gap-1.5 overflow-x-auto max-w-full py-1">
-                {effectiveNotes.map((note, idx) => (
-                  <button
-                    key={note.id || idx}
-                    onClick={() => {
-                      setSelectedNoteIndex(idx);
+                  onClick={() => {
+                    const nextIdx = Math.max(0, selectedNoteIndex - 1);
+                    setSelectedNoteIndex(nextIdx);
+                    const note = effectiveNotes[nextIdx];
+                    if (note) {
                       synth.playMidiNote(note.midi, 0.4);
                       if (audioRef.current && !isPracticing) {
                         audioRef.current.currentTime = Math.max(0, note.start - 0.1);
                         setCurrentTimeDisplay(audioRef.current.currentTime);
                       }
-                    }}
-                    style={{ width: '74px', minWidth: '74px', maxWidth: '74px' }}
-                    className={`h-8 rounded-lg text-xs font-mono font-bold transition-all shrink-0 flex items-center justify-center text-center ${
-                      idx === selectedNoteIndex
-                        ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30'
-                        : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
-                    }`}
-                  >
-                    {idx + 1}. {note.note_name}
-                  </button>
-                ))}
+                    }
+                  }}
+                  disabled={selectedNoteIndex <= 0}
+                  className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                  title="Previous Note (←)"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => {
+                    const nextIdx = Math.min(effectiveNotes.length - 1, selectedNoteIndex + 1);
+                    setSelectedNoteIndex(nextIdx);
+                    const note = effectiveNotes[nextIdx];
+                    if (note) {
+                      synth.playMidiNote(note.midi, 0.4);
+                      if (audioRef.current && !isPracticing) {
+                        audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                        setCurrentTimeDisplay(audioRef.current.currentTime);
+                      }
+                    }
+                  }}
+                  disabled={selectedNoteIndex >= effectiveNotes.length - 1}
+                  className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                  title="Next Note (→)"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
               </div>
+
+              {/* Target Note Badge */}
+              {selectedNote && (
+                <div className="flex items-center gap-2 px-3 py-1 bg-amber-950/40 border border-amber-500/40 rounded-xl">
+                  <Target className="w-4 h-4 text-amber-400" />
+                  <span className="text-xs text-slate-400">Target Note {selectedNoteIndex + 1}/{effectiveNotes.length}:</span>
+                  <strong className="text-sm font-mono font-bold text-amber-300">{selectedNote.note_name}</strong>
+                  <span className="text-xs text-slate-400 font-mono">({selectedNote.frequency.toFixed(1)} Hz)</span>
+                  <span className="text-xs text-slate-500 font-mono">[{selectedNote.start.toFixed(2)}s - {selectedNote.end.toFixed(2)}s]</span>
+                </div>
+              )}
+
+              {/* Audition Note with Synth */}
+              {selectedNote && (
+                <button
+                  onClick={() => synth.playMidiNote(selectedNote.midi, 0.6)}
+                  className="flex items-center gap-1.5 px-3 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-cyan-300 transition-all"
+                  title="Hear target note pitch with reference synth"
+                >
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <span>Hear Pitch</span>
+                </button>
+              )}
+
+              {/* Loop Note Toggle */}
+              <button
+                onClick={() => setLoopNote((prev) => !prev)}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
+                  loopNote
+                    ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+                title="Loop playback on this specific note"
+              >
+                <Repeat className="w-3.5 h-3.5" />
+                <span>Loop Note</span>
+              </button>
+            </div>
+
+            {/* Quick Note Selector Carousel */}
+            <div className="flex items-center gap-1.5 overflow-x-auto max-w-full py-1">
+              {effectiveNotes.map((note, idx) => (
+                <button
+                  key={note.id || idx}
+                  onClick={() => {
+                    setSelectedNoteIndex(idx);
+                    synth.playMidiNote(note.midi, 0.4);
+                    if (audioRef.current && !isPracticing) {
+                      audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                      setCurrentTimeDisplay(audioRef.current.currentTime);
+                    }
+                  }}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold transition-all shrink-0 ${
+                    idx === selectedNoteIndex
+                      ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30'
+                      : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                  }`}
+                >
+                  {idx + 1}. {note.note_name}
+                </button>
+              ))}
             </div>
           </div>
         )}
@@ -1679,6 +1531,17 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         </div>
       </div>
 
+      {/* Smart Beat-Synced Metronome */}
+      <SmartMetronome
+        detectedBpm={transcription.bpm}
+        firstBeatTime={effectiveNotes[0]?.start ?? 0}
+        isPlaying={isPracticing}
+        currentTime={currentTimeDisplay}
+        playbackSpeed={playbackSpeed}
+        defaultEnabled={false}
+        onGridChange={setMetronomeGrid}
+      />
+
       {/* Dual Layer Real-time Pitch Canvas Container */}
       <div className="daw-panel p-4 border border-slate-800 bg-slate-900/50 rounded-2xl space-y-2 relative">
         <div className="flex items-center justify-between text-xs text-slate-400 px-1">
@@ -1709,8 +1572,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 </div>
                 <p className="text-sm font-semibold tracking-wider text-slate-300 uppercase">
                   {practiceMode === 'note' && selectedNote
-                    ? `Get ready for note: ${selectedNote.note_name} (${countdownValue})`
-                    : `Get ready for the track (${countdownValue})`}
+                    ? `Get Ready for Note: ${selectedNote.note_name}`
+                    : 'Get ready to sing with the track...'}
                 </p>
                 <button
                   onClick={cancelCountdown}

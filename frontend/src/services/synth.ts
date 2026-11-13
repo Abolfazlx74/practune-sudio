@@ -64,6 +64,32 @@ class WebAudioSynth {
     osc1.stop(stopTime + release);
     osc2.stop(stopTime + release);
   }
+
+  public playMetronomeClick(accent: 'downbeat' | 'secondary' | 'normal' = 'normal') {
+    this.init();
+    if (!this.ctx) return;
+
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+
+    const freq = accent === 'downbeat' ? 1320 : accent === 'secondary' ? 990 : 780;
+    const peakGain = accent === 'downbeat' ? 0.38 : accent === 'secondary' ? 0.26 : 0.22;
+
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(freq, now);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.55, now + 0.045);
+
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.linearRampToValueAtTime(peakGain, now + 0.004);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+
+    osc.connect(gain);
+    gain.connect(this.ctx.destination);
+
+    osc.start(now);
+    osc.stop(now + 0.06);
+  }
 }
 
 export const synth = new WebAudioSynth();
