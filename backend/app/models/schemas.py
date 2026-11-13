@@ -43,16 +43,36 @@ class PitchFrame(BaseModel):
     midi: float
     confidence: float
 
+class TransitionRegion(BaseModel):
+    start: float
+    end: float
+    from_note: Optional[str] = None
+    to_note: Optional[str] = None
+    from_midi: Optional[float] = None
+    to_midi: Optional[float] = None
+    transition_type: str = "slide"  # slide, attack, release
+
+class VibratoInfo(BaseModel):
+    note_id: str
+    rate_hz: float = 0.0  # typical 4-7 Hz
+    extent_cents: float = 0.0  # peak-to-peak depth in cents
+    has_vibrato: bool = False
+
 class TranscriptionResult(BaseModel):
     audio_id: str
     notes: List[NoteItem]
     pitch_contour: List[PitchFrame] = []
+    transitions: List[TransitionRegion] = []
+    vibratos: List[VibratoInfo] = []
     bpm: float
     key_estimate: str
     scale_estimate: str
     duration: float
     confidence_overall: float
-    transcription_engine: str = "Spotify Basic Pitch / pYIN Hybrid"
+    transcription_engine: str = "DSP YIN & Onset Tracker"
+    pipeline_version: Optional[str] = "2.2.0"
+    is_monophonic: Optional[bool] = True
+    audio_suitability_warning: Optional[str] = None
 
 class CorrectionRequest(BaseModel):
     pitch_center_strength: float = Field(0.5, ge=0.0, le=1.0)
@@ -73,6 +93,9 @@ class EvaluationRequest(BaseModel):
     reference_notes: List[NoteItem]
     performance_pitches: List[PitchFrame]
     tolerance_cents: float = 50.0
+    transitions: Optional[List[TransitionRegion]] = []
+    evaluation_mode: str = "live"  # "live" or "imported"
+    studio_type: str = "vocal"  # "vocal" or "instrument"
 
 class EvaluationResponse(BaseModel):
     pitch_accuracy: float
@@ -82,6 +105,8 @@ class EvaluationResponse(BaseModel):
     overall_score: float
     feedback: List[str]
     note_scores: List[NoteScore] = []
+    # Performance contour for imported performance visualization
+    performance_contour: Optional[List[PitchFrame]] = None
     # Diagnostic / transparency fields
     detected_reference_notes_count: int = 0
     detected_live_notes_count: int = 0
@@ -89,3 +114,5 @@ class EvaluationResponse(BaseModel):
     extra_notes_count: int = 0
     alignment_offset_ms: float = 0.0
     avg_cents_error: float = 0.0
+    evaluation_mode: str = "live"  # "live" or "imported"
+    studio_type: str = "vocal"  # "vocal" or "instrument"

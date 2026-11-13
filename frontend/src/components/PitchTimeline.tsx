@@ -68,7 +68,8 @@ export const PitchTimeline: React.FC<PitchTimelineProps> = ({
       // Semitone Label
       if (m % 2 === 0 || m % 12 === 0) {
         const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-        const octave = Math.floor(m / 12) - 1;
+        // FL Studio standard: MIDI 60 is C5
+        const octave = Math.floor(m / 12);
         const name = `${NOTE_NAMES[m % 12]}${octave}`;
         ctx.fillStyle = '#64748b';
         ctx.font = '9px monospace';

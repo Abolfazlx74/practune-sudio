@@ -62,7 +62,9 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
             </div>
             <div>
               <h2 className="text-base font-bold text-white tracking-tight">Performance Evaluation</h2>
-              <p className="text-xs text-slate-400">Practice session pitch and timing results</p>
+              <p className="text-xs text-slate-400">
+                {evaluation.evaluation_mode === 'imported' ? 'Imported performance audio evaluation' : 'Practice session pitch and timing results'}
+              </p>
             </div>
           </div>
           <button

@@ -96,7 +96,8 @@ export async function correctPitch(audioId: string, options: CorrectionOptions):
 export async function evaluatePractice(
   referenceNotes: NoteItem[],
   performancePitches: PitchFrame[],
-  toleranceCents = 50.0
+  toleranceCents = 50.0,
+  studioType: 'vocal' | 'instrument' = 'vocal'
 ): Promise<EvaluationResponse> {
   const res = await fetch(`${API_BASE}/practice/evaluate`, {
     method: 'POST',
@@ -105,12 +106,40 @@ export async function evaluatePractice(
       reference_notes: referenceNotes,
       performance_pitches: performancePitches,
       tolerance_cents: toleranceCents,
+      studio_type: studioType,
     }),
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Practice evaluation failed' }));
     throw new Error(err.detail || 'Practice evaluation failed');
+  }
+
+  return res.json();
+}
+
+export async function evaluateRecordedPerformance(
+  audioId: string,
+  audioFile: File,
+  toleranceCents = 50.0,
+  transposeSemitones = 0,
+  studioType: 'vocal' | 'instrument' = 'vocal'
+): Promise<EvaluationResponse> {
+  const formData = new FormData();
+  formData.append('audio_id', audioId);
+  formData.append('file', audioFile);
+  formData.append('tolerance_cents', toleranceCents.toString());
+  formData.append('transpose_semitones', transposeSemitones.toString());
+  formData.append('studio_type', studioType);
+
+  const res = await fetch(`${API_BASE}/practice/evaluate-recording`, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Recorded audio evaluation failed' }));
+    throw new Error(err.detail || 'Recorded audio evaluation failed');
   }
 
   return res.json();

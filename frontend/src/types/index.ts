@@ -32,16 +32,38 @@ export interface PitchFrame {
   confidence: number;
 }
 
+export interface TransitionRegion {
+  start: number;
+  end: number;
+  from_note?: string;
+  to_note?: string;
+  from_midi?: number;
+  to_midi?: number;
+  transition_type: string;
+}
+
+export interface VibratoInfo {
+  note_id: string;
+  rate_hz: number;
+  extent_cents: number;
+  has_vibrato: boolean;
+}
+
 export interface TranscriptionResult {
   audio_id: string;
   notes: NoteItem[];
   pitch_contour: PitchFrame[];
+  transitions?: TransitionRegion[];
+  vibratos?: VibratoInfo[];
   bpm: number;
   key_estimate: string;
   scale_estimate: string;
   duration: number;
   confidence_overall: number;
   transcription_engine: string;
+  pipeline_version?: string;
+  is_monophonic?: boolean;
+  audio_suitability_warning?: string | null;
 }
 
 export interface PreprocessOptions {
@@ -77,12 +99,15 @@ export interface EvaluationResponse {
   overall_score: number;
   feedback: string[];
   note_scores: NoteScore[];
+  performance_contour?: PitchFrame[];
   detected_reference_notes_count?: number;
   detected_live_notes_count?: number;
   missed_notes_count?: number;
   extra_notes_count?: number;
   alignment_offset_ms?: number;
   avg_cents_error?: number;
+  evaluation_mode?: string;
+  studio_type?: string;
 }
 
 export interface PerformanceRecord {

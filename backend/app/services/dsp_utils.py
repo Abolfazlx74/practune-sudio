@@ -14,7 +14,7 @@ def midi_to_hz(midi: float) -> float:
 
 def load_audio(filepath: str, target_sr: int = 22050) -> Tuple[np.ndarray, int, float]:
     """
-    Loads audio using soundfile. Converts to mono and resamples if needed.
+    Loads audio using soundfile. Converts to mono, removes DC bias, and resamples cleanly.
     Returns (samples_array, sample_rate, duration_seconds)
     """
     data, sr = sf.read(filepath, dtype='float32')
@@ -22,10 +22,21 @@ def load_audio(filepath: str, target_sr: int = 22050) -> Tuple[np.ndarray, int, 
     if data.ndim > 1:
         data = np.mean(data, axis=1)
 
+    # Remove DC bias to prevent pitch detection asymmetry
+    dc_offset = float(np.mean(data))
+    if abs(dc_offset) > 1e-5:
+        data = data - dc_offset
+
     # Resample if sample rate differs
     if sr != target_sr:
-        num_samples = int(len(data) * target_sr / sr)
-        data = scipy.signal.resample(data, num_samples)
+        gcd = math.gcd(int(sr), int(target_sr))
+        up = target_sr // gcd
+        down = sr // gcd
+        if up < 1500 and down < 1500:
+            data = scipy.signal.resample_poly(data, up, down).astype(np.float32)
+        else:
+            num_samples = int(round(len(data) * target_sr / sr))
+            data = scipy.signal.resample(data, num_samples).astype(np.float32)
         sr = target_sr
 
     duration = float(len(data)) / float(sr)
@@ -40,6 +51,7 @@ def compute_yin_pitch(
 ) -> Tuple[float, float]:
     """
     Computes fundamental frequency (Hz) and confidence for a single audio frame using YIN.
+    Includes sub-harmonic and octave jump validation.
     """
     w_len = len(frame)
     min_tau = max(2, int(sr / fmax))
@@ -49,24 +61,13 @@ def compute_yin_pitch(
         return 0.0, 0.0
 
     # 1. Difference function d(tau) = sum (x[j] - x[j+tau])^2
-    # Efficient calculation via autocorrelation / squared terms
     x = frame.astype(np.float64)
-    # Energy of frames
-    x_pad = np.pad(x, (0, max_tau), mode='constant')
-    # Use direct FFT correlation
-    fft_size = 1 << (2 * len(x_pad) - 1).bit_length()
-    X = np.fft.rfft(x_pad, n=fft_size)
-    r = np.fft.irfft(X * np.conj(X), n=fft_size)
-
-    # d(tau) = r(0) + r(0)_shifted - 2*r(tau)
-    # Direct computation for stability over small max_tau:
     d = np.zeros(max_tau)
-    # For small window (e.g. 1024 or 2048), fast slice sum:
     for tau in range(1, max_tau):
         diff = x[:w_len - tau] - x[tau:w_len]
         d[tau] = np.sum(diff * diff)
 
-    # 2. Cumulative mean normalized difference function
+    # 2. Cumulative mean normalized difference function (CMNDF)
     cmndf = np.zeros(max_tau)
     cmndf[0] = 1.0
     running_sum = 0.0
@@ -77,7 +78,7 @@ def compute_yin_pitch(
         else:
             cmndf[tau] = d[tau] / (running_sum / tau)
 
-    # 3. Absolute thresholding
+    # 3. Absolute thresholding (first dip below threshold prevents octave halving)
     tau_chosen = -1
     for tau in range(min_tau, max_tau):
         if cmndf[tau] < threshold:
@@ -87,21 +88,27 @@ def compute_yin_pitch(
             break
 
     if tau_chosen == -1:
-        # Find global minimum in search range
+        # Find global minimum in search range with unvoiced rejection
         tau_chosen = min_tau + int(np.argmin(cmndf[min_tau:max_tau]))
         if cmndf[tau_chosen] > 0.40:
-            # Unvoiced / silence
             return 0.0, 0.0
 
-    # 4. Parabolic interpolation for sub-sample accuracy
+    # 4. Octave error validation: check if half-period is also a valid minimum
+    half_tau = tau_chosen // 2
+    if half_tau >= min_tau and cmndf[half_tau] < threshold * 1.35:
+        if (half_tau == min_tau or cmndf[half_tau] <= cmndf[half_tau - 1]) and \
+           (half_tau == max_tau - 1 or cmndf[half_tau] <= cmndf[half_tau + 1]):
+            tau_chosen = half_tau
+
+    # 5. Parabolic interpolation for sub-sample accuracy
     if 0 < tau_chosen < max_tau - 1:
         alpha = cmndf[tau_chosen - 1]
         beta = cmndf[tau_chosen]
         gamma = cmndf[tau_chosen + 1]
         denom = 2.0 * (alpha - 2.0 * beta + gamma)
-        if denom != 0:
+        if abs(denom) > 1e-9:
             delta = (alpha - gamma) / denom
-            final_tau = tau_chosen + delta
+            final_tau = tau_chosen + max(-0.5, min(0.5, delta))
         else:
             final_tau = float(tau_chosen)
     else:

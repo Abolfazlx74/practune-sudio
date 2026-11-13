@@ -89,7 +89,8 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
 
       ctx.fillStyle = isBlack ? '#94a3b8' : '#e2e8f0';
       ctx.font = '9px monospace';
-      const octave = Math.floor(m / 12) - 1;
+      // FL Studio standard: MIDI 60 is C5
+      const octave = Math.floor(m / 12);
       const noteName = `${NOTE_NAMES[noteIdx]}${octave}`;
       if (!isBlack || noteIdx === 1 || noteIdx === 6) {
         ctx.fillText(noteName, 4, y + KEY_HEIGHT - 4);
@@ -226,7 +227,7 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
         } else {
           const newStart = Math.max(0, n.start + deltaX);
           const newMidi = Math.max(MIN_MIDI, Math.min(MAX_MIDI, n.midi + deltaMidi));
-          const octave = Math.floor(newMidi / 12) - 1;
+          const octave = Math.floor(newMidi / 12);
           const noteName = `${NOTE_NAMES[newMidi % 12]}${octave}`;
           return {
             ...n,

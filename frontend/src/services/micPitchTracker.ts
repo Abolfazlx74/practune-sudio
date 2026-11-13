@@ -13,7 +13,8 @@ const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", 
 
 function midiToNote(midi: number): { noteName: string; octave: number; cents: number } {
   const rounded = Math.round(midi);
-  const octave = Math.floor(rounded / 12) - 1;
+  // FL Studio standard: MIDI 60 is C5, MIDI 69 is A5 (440Hz), MIDI 70 is A#5
+  const octave = Math.floor(rounded / 12);
   const name = NOTE_NAMES[((rounded % 12) + 12) % 12];
   const cents = (midi - rounded) * 100;
   return { noteName: `${name}${octave}`, octave, cents: Math.round(cents) };
@@ -93,8 +94,8 @@ export class MicPitchTracker {
     const sampleRate = this.audioCtx.sampleRate;
     const { freq, confidence } = this.yinDetect(buffer, sampleRate);
 
-    // Gate threshold: ignore silence/whispers (RMS < 0.015) or low confidence (< 0.6)
-    const isVoiced = rms > 0.015 && confidence > 0.55 && freq >= 65 && freq <= 1500;
+    // Gate threshold: sensitive enough to capture quiet acoustic instruments & voice, rejects silence/hiss (RMS < 0.007)
+    const isVoiced = rms > 0.007 && confidence > 0.48 && freq >= 55 && freq <= 1760;
 
     let midi = 0;
     let noteName = '--';

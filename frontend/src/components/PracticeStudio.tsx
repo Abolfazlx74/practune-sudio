@@ -18,11 +18,12 @@ import {
   EyeOff,
   Mic2,
   Piano,
+  Upload,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
 import type { LivePitchData } from '../services/micPitchTracker';
-import { getAudioFileUrl, evaluatePractice } from '../services/api';
+import { getAudioFileUrl, evaluatePractice, evaluateRecordedPerformance } from '../services/api';
 import { synth } from '../services/synth';
 import { recordPracticeSession } from '../services/historyService';
 import { recordPerformanceToProject } from '../services/projectService';
@@ -61,6 +62,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [livePitch, setLivePitch] = useState<LivePitchData | null>(null);
   const [evaluation, setEvaluation] = useState<EvaluationResponse | null>(null);
   const [isEvaluating, setIsEvaluating] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
   // Studio Domain Mode (Vocal vs Instrument) & Blind Memory Mode
@@ -91,6 +94,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const recentMicMidisRef = useRef<number[]>([]);
   const smoothedMidiRef = useRef<number | null>(null);
   const animRef = useRef<number | null>(null);
+  const isStoppingRef = useRef<boolean>(false);
 
   // Sync mute state with reference audio element
   useEffect(() => {
@@ -114,13 +118,55 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   };
 
   // Transpose notes for practice if user changes key
-  const effectiveNotes: NoteItem[] = transcription.notes.map((n) => {
-    const newMidi = n.midi + transposeSemitones;
-    const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-    const octave = Math.floor(newMidi / 12) - 1;
-    const name = `${NOTE_NAMES[((newMidi % 12) + 12) % 12]}${octave}`;
-    return { ...n, midi: newMidi, note_name: name };
-  });
+  const transposedNotes: NoteItem[] = React.useMemo(() => {
+    return transcription.notes.map((n) => {
+      const newMidi = n.midi + transposeSemitones;
+      const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+      // FL Studio standard: MIDI 60 is C5, MIDI 69 is A5 (440Hz), MIDI 70 is A#5
+      const octave = Math.floor(newMidi / 12);
+      const name = `${NOTE_NAMES[((newMidi % 12) + 12) % 12]}${octave}`;
+      const newFreq = 440 * Math.pow(2, (newMidi - 69) / 12);
+      return { ...n, midi: newMidi, note_name: name, frequency: Math.round(newFreq * 10) / 10 };
+    });
+  }, [transcription.notes, transposeSemitones]);
+
+  // In Instrument Mode: isolate clean main notes, filtering out transition micro-glitches (< 90ms)
+  const effectiveNotes: NoteItem[] = React.useMemo(() => {
+    if (studioType !== 'instrument') {
+      return transposedNotes;
+    }
+    const clean: NoteItem[] = [];
+    for (let i = 0; i < transposedNotes.length; i++) {
+      const n = transposedNotes[i];
+      const dur = n.end - n.start;
+      if (dur < 0.09 && transposedNotes.length > 1) {
+        const prev = i > 0 ? transposedNotes[i - 1] : null;
+        const next = i < transposedNotes.length - 1 ? transposedNotes[i + 1] : null;
+        if (prev && next && Math.abs(prev.midi - next.midi) >= 1) {
+          continue; // inter-note slide / glitch
+        }
+        if (dur < 0.07) continue;
+      }
+      clean.push(n);
+    }
+    const candidates = clean.length > 0 ? clean : transposedNotes;
+    // Merge consecutive split notes of same pitch with tiny rest (< 100ms)
+    const merged: NoteItem[] = [];
+    for (const n of candidates) {
+      if (merged.length === 0) {
+        merged.push({ ...n });
+        continue;
+      }
+      const last = merged[merged.length - 1];
+      if (last.midi === n.midi && (n.start - last.end) < 0.10) {
+        last.end = n.end;
+        last.duration = Math.round((last.end - last.start) * 1000) / 1000;
+      } else {
+        merged.push({ ...n });
+      }
+    }
+    return merged;
+  }, [transposedNotes, studioType]);
 
   // De-spiked & Smoothed Continuous F0 Contour (9-point Median Filter + Gaussian Smooth)
   const rawContour: PitchFrame[] = React.useMemo(() => {
@@ -185,6 +231,15 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   // Helper to get reference MIDI at any timestamp
   const getTargetMidiAtTime = (t: number): number | null => {
+    // 1. Direct matching with musical note plateaus (prevents transition glitches from skewing target)
+    const refNote = practiceMode === 'note' && selectedNote
+      ? selectedNote
+      : effectiveNotes.find((n) => t >= n.start - 0.03 && t <= n.end + 0.03);
+    if (refNote) {
+      return refNote.midi;
+    }
+
+    // 2. Continuous contour interpolation during valid inter-note slides
     if (studioType === 'vocal' && rawContour.length > 0) {
       let lo = 0;
       let hi = rawContour.length - 1;
@@ -197,18 +252,16 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       const p1 = lo > 0 ? rawContour[lo - 1] : p2;
 
       if (p1 && p2 && p1.midi > 0 && p2.midi > 0 && p2.time - p1.time <= 0.15 && p2.time > p1.time) {
-        const ratio = Math.max(0, Math.min(1, (t - p1.time) / (p2.time - p1.time)));
-        return p1.midi + (p2.midi - p1.midi) * ratio;
+        if (Math.abs(p2.midi - p1.midi) <= 6.0) {
+          const ratio = Math.max(0, Math.min(1, (t - p1.time) / (p2.time - p1.time)));
+          return p1.midi + (p2.midi - p1.midi) * ratio;
+        }
       }
-      if (p2 && p2.midi > 0 && Math.abs(p2.time - t) <= 0.12) {
+      if (p2 && p2.midi > 0 && Math.abs(p2.time - t) <= 0.10) {
         return p2.midi;
       }
-      return null;
     }
-    const refNote = practiceMode === 'note' && selectedNote
-      ? selectedNote
-      : effectiveNotes.find((n) => t >= n.start && t <= n.end);
-    return refNote ? refNote.midi : null;
+    return null;
   };
 
   // Check if a sung MIDI matches the reference contour within a ±0.20s window
@@ -230,7 +283,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       return false;
     }
     const targetMidi = getTargetMidiAtTime(t);
-    return targetMidi !== null && Math.abs(userMidi - targetMidi) <= 0.65;
+    if (targetMidi === null) return false;
+    const diff = Math.abs(userMidi - targetMidi);
+    return diff <= 0.85 || Math.round(userMidi) === Math.round(targetMidi);
   };
 
   // Fast median despiker with octave lock (zero phase-delay lag on note transitions)
@@ -336,6 +391,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   // Actual execution of practice session
   const executeStartPractice = async () => {
     try {
+      isStoppingRef.current = false;
       userPitchHistory.current = [];
       livePitchRef.current = null;
       recentMicMidisRef.current = [];
@@ -410,7 +466,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           const medMidi = sorted[Math.floor(sorted.length / 2)];
           const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
           const rMidi = Math.round(medMidi);
-          const octave = Math.floor(rMidi / 12) - 1;
+          const octave = Math.floor(rMidi / 12);
           const segId = typeof template.id === 'number' ? segments.length + 1 : `vocal_seg_${segments.length}`;
           segments.push({
             ...template,
@@ -454,45 +510,97 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setShowPostBlindAnalysis(true);
     }
 
-    if (userPitchHistory.current.length > 0) {
-      setIsEvaluating(true);
-      try {
-        const evalTargetNotes =
-          practiceMode === 'note' && selectedNote
-            ? [selectedNote]
-            : effectiveNotes;
-        const tolerance = studioType === 'vocal' ? 60.0 : 50.0;
-        const resp = await evaluatePractice(evalTargetNotes, userPitchHistory.current, tolerance);
-        setEvaluation(resp);
+    const recordedPitches = [...userPitchHistory.current];
+    setIsEvaluating(true);
+    try {
+      const evalTargetNotes =
+        practiceMode === 'note' && selectedNote
+          ? [selectedNote]
+          : effectiveNotes;
+      const tolerance = studioType === 'vocal' ? 60.0 : 70.0;
+      const resp = await evaluatePractice(evalTargetNotes, recordedPitches, tolerance, studioType);
+      setEvaluation(resp);
 
-        const currentSettings: PracticeConfigSettings = {
-          mode: practiceMode,
-          target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
-          target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
-          playback_speed: playbackSpeed,
-          transpose_semitones: transposeSemitones,
-          tolerance_cents: tolerance,
-        };
+      const currentSettings: PracticeConfigSettings = {
+        mode: practiceMode,
+        target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
+        target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
+        playback_speed: playbackSpeed,
+        transpose_semitones: transposeSemitones,
+        tolerance_cents: tolerance,
+      };
 
-        const sessionAudio = audioInfo || {
-          id: audioId,
-          filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
-          duration: duration,
-        };
+      const sessionAudio = audioInfo || {
+        id: audioId,
+        filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
+        duration: duration,
+      };
 
-        recordPracticeSession(sessionAudio, currentSettings, resp);
-        await recordPerformanceToProject(
-          currentProjectId || audioId,
-          sessionAudio,
-          currentSettings,
-          resp
-        );
-        onPracticeModified?.();
-      } catch (err: any) {
-        console.error('Evaluation error:', err?.message || JSON.stringify(err));
-      } finally {
-        setIsEvaluating(false);
+      recordPracticeSession(sessionAudio, currentSettings, resp);
+      await recordPerformanceToProject(
+        currentProjectId || audioId,
+        sessionAudio,
+        currentSettings,
+        resp
+      );
+      onPracticeModified?.();
+    } catch (err: any) {
+      console.error('Evaluation error:', err?.message || JSON.stringify(err));
+    } finally {
+      setIsEvaluating(false);
+      isStoppingRef.current = false;
+    }
+  };
+
+  const handleImportPerformanceClick = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
+    }
+  };
+
+  const handlePerformanceFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsImporting(true);
+    try {
+      const tolerance = studioType === 'vocal' ? 60.0 : 70.0;
+      const resp = await evaluateRecordedPerformance(audioId, file, tolerance, transposeSemitones, studioType);
+
+      if (resp.performance_contour && resp.performance_contour.length > 0) {
+        userPitchHistory.current = resp.performance_contour;
       }
+      setEvaluation(resp);
+
+      const currentSettings: PracticeConfigSettings = {
+        mode: practiceMode,
+        target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
+        target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
+        playback_speed: playbackSpeed,
+        transpose_semitones: transposeSemitones,
+        tolerance_cents: tolerance,
+      };
+
+      const sessionAudio = audioInfo || {
+        id: audioId,
+        filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
+        duration: duration,
+      };
+
+      recordPracticeSession(sessionAudio, currentSettings, resp);
+      await recordPerformanceToProject(
+        currentProjectId || audioId,
+        sessionAudio,
+        currentSettings,
+        resp
+      );
+      onPracticeModified?.();
+      drawPracticeCanvas();
+    } catch (err: any) {
+      alert(`Performance evaluation failed: ${err.message || 'Error evaluating audio file'}`);
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -563,6 +671,18 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       if (currentTime >= loopEnd) {
         audioRef.current.currentTime = loopStart;
       }
+    } else if (isPracticing && !isStoppingRef.current && practiceMode === 'note' && selectedNote && !loopNote) {
+      // Single note practice without looping: complete session when note ends
+      if (currentTime >= selectedNote.end + 0.25) {
+        isStoppingRef.current = true;
+        stopPracticeSession();
+      }
+    } else if (isPracticing && !isStoppingRef.current && practiceMode === 'full' && audioRef.current) {
+      // Full practice watchdog: auto-complete if playback reached the end
+      if (audioRef.current.ended || (duration > 0 && currentTime >= duration - 0.08)) {
+        isStoppingRef.current = true;
+        stopPracticeSession();
+      }
     }
 
     // Smoothly update digital clock display
@@ -605,7 +725,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         ctx.stroke();
 
         const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-        const octave = Math.floor(m / 12) - 1;
+        const octave = Math.floor(m / 12);
         ctx.fillStyle = m % 12 === 0 ? '#94a3b8' : '#475569';
         ctx.font = '9px monospace';
         ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
@@ -627,6 +747,11 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           const p1 = rawContour[i - 1];
           const p2 = rawContour[i];
           if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.18) continue;
+
+          // Prevent drawing vertical plummeting artifact lines across sudden sub-harmonic octave drops
+          const dt = p2.time - p1.time;
+          const dm = Math.abs(p2.midi - p1.midi);
+          if (dm > 5.5 && dt < 0.05) continue;
 
           const x1 = timeToX(p1.time);
           const x2 = timeToX(p2.time);
@@ -682,7 +807,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         for (let i = 1; i < history.length; i++) {
           const p1 = history[i - 1];
           const p2 = history[i];
-          if (p2.time - p1.time > 0.18 || p2.time > currentTime) continue;
+          if (p2.time - p1.time > 0.18 || p2.time > currentTime || (Math.abs(p2.midi - p1.midi) > 6.0 && p2.time - p1.time < 0.05)) continue;
 
           const x1 = timeToX(p1.time);
           const x2 = timeToX(p2.time);
@@ -822,7 +947,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       ctx.stroke();
 
       const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-      const octave = Math.floor(m / 12) - 1;
+      const octave = Math.floor(m / 12);
       ctx.fillStyle = m % 12 === 0 ? '#94a3b8' : '#475569';
       ctx.font = '9px monospace';
       ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
@@ -883,52 +1008,58 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       });
     }
 
-    // 3. Rectangular Gate Pointer
-    let gateStroke = 'rgba(148, 163, 184, 0.55)';
-    let gateFill = 'rgba(148, 163, 184, 0.07)';
-    let gateGlow = 'transparent';
+    // 3. Linear Timeline Playhead (حالت خطی)
+    let lineStroke = 'rgba(56, 189, 248, 0.45)';
+    let lineGlow = 'transparent';
 
     if (isPracticing && currentLive?.isVoiced) {
       const targetNote = practiceMode === 'note' && selectedNote ? selectedNote : activeGateNote;
       if (targetNote) {
-        const isCorrectNote = Math.abs(currentLive.midi - targetNote.midi) <= 0.65;
+        const semitoneDiff = Math.abs(currentLive.midi - targetNote.midi);
+        const isCorrectNote = semitoneDiff <= 0.85 || Math.round(currentLive.midi) === targetNote.midi;
         if (isCorrectNote) {
-          gateStroke = '#39ff14';
-          gateFill = 'rgba(57, 255, 20, 0.16)';
-          gateGlow = '#39ff14';
+          lineStroke = '#39ff14';
+          lineGlow = '#39ff14';
         } else {
-          gateStroke = '#ef4444';
-          gateFill = 'rgba(239, 68, 68, 0.22)';
-          gateGlow = '#ef4444';
+          lineStroke = '#ef4444';
+          lineGlow = '#ef4444';
         }
       } else {
-        gateStroke = '#ef4444';
-        gateFill = 'rgba(239, 68, 68, 0.16)';
-        gateGlow = '#ef4444';
+        // In inter-note gaps / transitions: keep line neutral
+        lineStroke = 'rgba(148, 163, 184, 0.55)';
+        lineGlow = 'transparent';
       }
     }
 
+    // Sleek Linear Timeline Playhead Line (حالت خطی)
     ctx.save();
-    ctx.fillStyle = gateFill;
-    ctx.strokeStyle = gateStroke;
-    ctx.lineWidth = 2.5;
-    if (gateGlow !== 'transparent') {
-      ctx.shadowColor = gateGlow;
-      ctx.shadowBlur = 16;
+    ctx.strokeStyle = lineStroke;
+    ctx.lineWidth = isPracticing && currentLive?.isVoiced ? 2.5 : 1.8;
+    if (lineGlow !== 'transparent') {
+      ctx.shadowColor = lineGlow;
+      ctx.shadowBlur = 14;
     }
     ctx.beginPath();
-    ctx.roundRect(gateX - gateWidth / 2, 24, gateWidth, axisY - 28, 6);
-    ctx.fill();
+    ctx.moveTo(gateX, 0);
+    ctx.lineTo(gateX, axisY);
     ctx.stroke();
     ctx.restore();
 
+    // Live Note Hit / Pointer Indicator at the Linear Timeline
     if (isPracticing && currentLive?.isVoiced) {
       const clampedMidi = Math.max(minMidi, Math.min(maxMidi, currentLive.midi));
       const userGateY = midiToY(clampedMidi) + 9;
-      ctx.fillStyle = gateStroke;
+      ctx.save();
+      ctx.fillStyle = lineStroke;
+      ctx.shadowColor = lineStroke;
+      ctx.shadowBlur = 14;
       ctx.beginPath();
-      ctx.roundRect(gateX - gateWidth / 2 + 2, userGateY - 5, gateWidth - 4, 10, 3);
+      ctx.arc(gateX, userGateY, 6, 0, Math.PI * 2);
       ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+      ctx.restore();
     }
 
     ctx.restore();
@@ -967,7 +1098,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const badgeY = 4;
 
     ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-    ctx.strokeStyle = gateStroke;
+    ctx.strokeStyle = lineStroke;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
@@ -1032,8 +1163,22 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       <audio
         ref={audioRef}
         src={getAudioFileUrl(audioId)}
-        onEnded={stopPracticeSession}
-        onTimeUpdate={(e) => setCurrentTimeDisplay(e.currentTarget.currentTime)}
+        onEnded={() => {
+          if (!isStoppingRef.current) {
+            isStoppingRef.current = true;
+            stopPracticeSession();
+          }
+        }}
+        onTimeUpdate={(e) => {
+          const ct = e.currentTarget.currentTime;
+          setCurrentTimeDisplay(ct);
+          if (isPracticing && !isStoppingRef.current && practiceMode === 'full' && duration > 0) {
+            if (e.currentTarget.ended || ct >= duration - 0.08) {
+              isStoppingRef.current = true;
+              stopPracticeSession();
+            }
+          }
+        }}
         preload="auto"
         muted={isMuted}
       />
@@ -1104,7 +1249,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               {isMuted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
             </button>
 
-            {/* Start / Finish Action Button */}
+            {/* Start / Finish Action Button & Imported Performance Option */}
             {!isPracticing ? (
               countdownValue !== null ? (
                 <button
@@ -1115,13 +1260,31 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                   Starting in {countdownValue}s... (Cancel)
                 </button>
               ) : (
-                <button
-                  onClick={handleStartPracticeClick}
-                  className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
-                >
-                  <Play className="w-4 h-4 fill-current ml-0.5" />
-                  {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleStartPracticeClick}
+                    className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
+                  >
+                    <Play className="w-4 h-4 fill-current ml-0.5" />
+                    {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
+                  </button>
+                  <button
+                    onClick={handleImportPerformanceClick}
+                    disabled={isImporting}
+                    className="flex items-center gap-2 px-4 py-2.5 bg-slate-900 border border-slate-700/80 hover:border-slate-600 hover:bg-slate-800 text-slate-200 font-semibold rounded-xl text-sm shadow-sm transition-all"
+                    title="Import an audio recording of your performance to evaluate against reference"
+                  >
+                    <Upload className="w-4 h-4 text-cyan-400" />
+                    {isImporting ? 'Analyzing Take...' : 'Import Performance'}
+                  </button>
+                  <input
+                    type="file"
+                    ref={fileInputRef}
+                    onChange={handlePerformanceFileChange}
+                    accept="audio/*,.wav,.mp3,.ogg,.flac,.m4a"
+                    className="hidden"
+                  />
+                </div>
               )
             ) : (
               <button

@@ -24,17 +24,12 @@ from app.services.practice_service import evaluate_performance
 
 
 def load_demo_reference():
-    trans_dir = Path(__file__).resolve().parent.parent / "storage" / "transcriptions"
-    json_files = list(trans_dir.glob("*.json"))
-    if not json_files:
-        raise FileNotFoundError("No reference transcription files found in storage/transcriptions")
-    
-    with open(json_files[0], "r", encoding="utf-8") as f:
-        data = json.load(f)
-        
-    ref_notes = [NoteItem(**n) for n in data["notes"]]
-    ref_contour = [PitchFrame(**p) for p in data["pitch_contour"]]
-    return ref_notes, ref_contour
+    from app.services.pitch_transcription import get_transcription
+    res = get_transcription("2ba782b5-c1d4-4031-ae0d-94a0a5047528")
+    if not res or not res.notes:
+        from app.services.pitch_transcription import transcribe_audio
+        res = transcribe_audio("2ba782b5-c1d4-4031-ae0d-94a0a5047528")
+    return res.notes, res.pitch_contour
 
 
 def test_scenario_1_identical_audio():
@@ -194,6 +189,119 @@ def test_scenario_7_silence_input():
     print(">>> PASS: Silence and unvoiced noise input handled cleanly with zero false positive score.")
 
 
+def test_scenario_8_imported_performance_mode():
+    """8. Imported Performance Mode: matching an uploaded audio file against reference."""
+    from app.services.practice_service import evaluate_imported_performance
+    demo_audio_id = "2ba782b5-c1d4-4031-ae0d-94a0a5047528"
+    audio_path = Path(__file__).resolve().parent.parent / "storage" / "uploads" / f"{demo_audio_id}.wav"
+    with open(audio_path, "rb") as f:
+        file_bytes = f.read()
+
+    resp = evaluate_imported_performance(
+        audio_id=demo_audio_id,
+        file_bytes=file_bytes,
+        filename="vocal_arpeggio_demo.wav",
+        tolerance_cents=50.0
+    )
+
+    print("\n--- [TEST 8] Imported Performance Audio Matching ---")
+    print(f"Overall: {resp.overall_score}% | Pitch: {resp.pitch_accuracy}% | Timing: {resp.timing_accuracy}% | Coverage: {resp.note_coverage}%")
+    print(f"Mode: {resp.evaluation_mode} | Performance Contour Frames: {len(resp.performance_contour) if resp.performance_contour else 0}")
+
+    assert resp.overall_score >= 98.0, f"Expected imported score >= 98%, got {resp.overall_score}%"
+    assert resp.pitch_accuracy >= 95.0
+    assert resp.timing_accuracy >= 98.0
+    assert resp.note_coverage == 100.0
+    assert resp.evaluation_mode == "imported"
+    assert resp.performance_contour is not None and len(resp.performance_contour) > 50
+    print(">>> PASS: Imported audio recording accurately decoded, aligned, and evaluated.")
+
+
+def test_scenario_9_transitions_and_vibrato_modeling():
+    """9. Transition and Vibrato Modeling: stable notes separate from pitch slides."""
+    from app.services.pitch_transcription import get_transcription
+    demo_audio_id = "2ba782b5-c1d4-4031-ae0d-94a0a5047528"
+    trans = get_transcription(demo_audio_id)
+    assert trans is not None
+    print("\n--- [TEST 9] Note Segmentation, Transitions & Vibrato Modeling ---")
+    print(f"Notes Count: {len(trans.notes)} | Transitions: {len(trans.transitions)} | Monophonic: {trans.is_monophonic}")
+    for tr in trans.transitions[:3]:
+        print(f"  Slide from {tr.from_note} to {tr.to_note} [{tr.start}s - {tr.end}s]")
+
+    assert len(trans.notes) >= 5, f"Expected at least 5 notes, got {len(trans.notes)}"
+    assert len(trans.transitions) >= 1, "Expected at least 1 transition region detected"
+    print(">>> PASS: Stable notes and pitch transition regions correctly extracted and categorized.")
+
+
+def test_scenario_10_deterministic_reproducibility():
+    """10. Deterministic Reproducibility: 10 repeated runs must produce mathematically identical results."""
+    notes, contour = load_demo_reference()
+    req = EvaluationRequest(reference_notes=notes, performance_pitches=contour, tolerance_cents=50.0)
+
+    scores = []
+    for _ in range(10):
+        resp = evaluate_performance(req)
+        scores.append(resp.overall_score)
+
+    print("\n--- [TEST 10] 10 Repeated Runs Determinism Check ---")
+    print(f"Scores across 10 runs: {scores}")
+    assert len(set(scores)) == 1, f"Non-deterministic scores detected: {set(scores)}"
+    print(">>> PASS: 100% deterministic reproducibility verified across repeated analysis cycles.")
+
+
+def test_scenario_11_instrument_mode_self_match():
+    """11. Instrument Mode: Dedicated discrete main-notes evaluation with transition immunity."""
+    notes, contour = load_demo_reference()
+    req = EvaluationRequest(
+        reference_notes=notes,
+        performance_pitches=contour,
+        tolerance_cents=70.0,
+        studio_type="instrument"
+    )
+    resp = evaluate_performance(req)
+
+    print("\n--- [TEST 11] Instrument Mode Self-Match ---")
+    print(f"Overall: {resp.overall_score}% | Pitch: {resp.pitch_accuracy}% | Timing: {resp.timing_accuracy}% | Coverage: {resp.note_coverage}%")
+    print(f"Mode: {resp.studio_type} | Ref Notes: {resp.detected_reference_notes_count} | Hits: {resp.detected_reference_notes_count - resp.missed_notes_count}")
+
+    assert resp.overall_score == 100.0, f"Expected 100% in instrument mode self-match, got {resp.overall_score}%"
+    assert resp.pitch_accuracy == 100.0
+    assert resp.timing_accuracy == 100.0
+    assert resp.note_coverage == 100.0
+    print(">>> PASS: Instrument Mode discrete note matching evaluated cleanly at 100%.")
+
+
+def test_scenario_12_instrument_mode_transition_immunity():
+    """12. Instrument Mode: Immunity to inter-note pitch fluctuations, slides, and finger shifts."""
+    notes, contour = load_demo_reference()
+
+    # Add chaotic pitch slides and fluctuations between notes
+    noisy_contour = []
+    for f in contour:
+        noisy_contour.append(f)
+
+    # Insert wild slides during rests / note boundaries
+    for n in notes:
+        noisy_contour.append(PitchFrame(time=round(n.start - 0.03, 3), frequency=220.0, midi=57.0, confidence=0.75))
+        noisy_contour.append(PitchFrame(time=round(n.end + 0.03, 3), frequency=330.0, midi=64.0, confidence=0.70))
+
+    noisy_contour.sort(key=lambda x: x.time)
+
+    req = EvaluationRequest(
+        reference_notes=notes,
+        performance_pitches=noisy_contour,
+        tolerance_cents=70.0,
+        studio_type="instrument"
+    )
+    resp = evaluate_performance(req)
+
+    print("\n--- [TEST 12] Instrument Mode Inter-Note Transition Immunity ---")
+    print(f"Overall: {resp.overall_score}% | Pitch: {resp.pitch_accuracy}% | Coverage: {resp.note_coverage}%")
+    assert resp.overall_score >= 98.0, f"Expected score >= 98% with transition immunity, got {resp.overall_score}%"
+    assert resp.note_coverage == 100.0
+    print(">>> PASS: Inter-note fluctuations and slides between notes successfully ignored in Instrument Mode.")
+
+
 if __name__ == "__main__":
     print("=" * 65)
     print("PRACTUNE STUDIO AUDIO MATCHING & EVALUATION ACCURACY TEST SUITE")
@@ -205,6 +313,11 @@ if __name__ == "__main__":
     test_scenario_5_missing_notes()
     test_scenario_6_correct_pitch_wrong_timing()
     test_scenario_7_silence_input()
+    test_scenario_8_imported_performance_mode()
+    test_scenario_9_transitions_and_vibrato_modeling()
+    test_scenario_10_deterministic_reproducibility()
+    test_scenario_11_instrument_mode_self_match()
+    test_scenario_12_instrument_mode_transition_immunity()
     print("\n" + "=" * 65)
-    print("ALL 7 AUDIO MATCHING VALIDATION TESTS PASSED WITH 100% SUCCESS!")
+    print("ALL 12 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 65)

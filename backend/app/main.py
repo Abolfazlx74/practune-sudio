@@ -24,7 +24,7 @@ from .services.audio_service import (
 from .services.dsp_service import apply_preprocessing, trim_audio
 from .services.pitch_transcription import transcribe_audio, get_transcription
 from .services.pitch_correction import simplify_and_correct_pitch
-from .services.practice_service import evaluate_performance
+from .services.practice_service import evaluate_performance, evaluate_imported_performance
 from .services.music_export import export_to_midi, export_to_musicxml
 
 app = FastAPI(
@@ -177,3 +177,27 @@ def evaluate_user_practice(request: EvaluationRequest):
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+
+@app.post("/api/practice/evaluate-recording", response_model=EvaluationResponse)
+async def evaluate_recorded_file(
+    audio_id: str = Form(...),
+    file: UploadFile = File(...),
+    tolerance_cents: float = Form(50.0),
+    transpose_semitones: int = Form(0),
+    studio_type: str = Form("vocal")
+):
+    try:
+        content = await file.read()
+        resp = evaluate_imported_performance(
+            audio_id=audio_id,
+            file_bytes=content,
+            filename=file.filename or "recording.wav",
+            tolerance_cents=tolerance_cents,
+            transpose_semitones=transpose_semitones,
+            studio_type=studio_type
+        )
+        return resp
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Recorded audio evaluation failed: {str(e)}")
