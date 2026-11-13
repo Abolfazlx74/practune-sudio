@@ -76,10 +76,9 @@ def run_yin_transcription(y: np.ndarray, sr: int) -> Tuple[List[NoteItem], List[
             return
 
         midis = [f.midi for f in seg]
-        weights = [f.confidence for f in seg]
-        avg_midi = float(np.average(midis, weights=weights)) if sum(weights) > 0 else float(np.median(midis))
-        rounded_midi = int(round(avg_midi))
-        note_name, octave, cents_dev = midi_to_note_info(avg_midi)
+        med_midi = float(np.median(midis))
+        rounded_midi = int(round(med_midi))
+        note_name, octave, cents_dev = midi_to_note_info(med_midi)
         freq = float(midi_to_hz(rounded_midi))
         conf = float(np.mean([f.confidence for f in seg]))
 
@@ -112,8 +111,8 @@ def run_yin_transcription(y: np.ndarray, sr: int) -> Tuple[List[NoteItem], List[
         smooth_jump = abs(smoothed_midis[idx] - smoothed_midis[idx - 1])
         is_onset = any(abs(frame.time - ot) < 0.04 for ot in onset_times)
 
-        # Break note on silence gap (> 85ms), distinct onset, or sustained pitch jump (>= 0.85 semitones)
-        if time_gap > 0.085 or (smooth_jump >= 0.85 and time_gap > 0.03) or is_onset:
+        # Break note on silence gap (> 80ms), distinct onset, or pitch transition (>= 0.75 semitones)
+        if time_gap > 0.080 or smooth_jump >= 0.75 or is_onset:
             commit_segment(current_segment)
             current_segment = [frame]
         else:
@@ -134,41 +133,9 @@ def transcribe_audio(audio_id: str) -> TranscriptionResult:
     bpm = estimate_bpm_tempo(y, sr)
     key_est, scale_est = estimate_key_chroma(y, sr)
 
-    engine_name = "YIN High-Precision"
-    notes: List[NoteItem] = []
-    pitch_frames: List[PitchFrame] = []
-
-    # Check for Spotify Basic Pitch if available
-    try:
-        from basic_pitch.inference import predict
-        model_output, midi_data, note_events = predict(str(audio_path))
-        for ne in note_events:
-            start_t = float(ne[0])
-            end_t = float(ne[1])
-            midi_pitch = int(round(ne[2]))
-            amplitude = float(ne[3]) if len(ne) > 3 else 0.85
-            note_name, octave, cents_dev = midi_to_note_info(midi_pitch)
-            freq = float(midi_to_hz(midi_pitch))
-
-            notes.append(NoteItem(
-                id=f"n_{uuid.uuid4().hex[:8]}",
-                midi=midi_pitch,
-                note_name=note_name,
-                octave=octave,
-                start=round(start_t, 3),
-                end=round(end_t, 3),
-                duration=round(end_t - start_t, 3),
-                confidence=round(min(1.0, amplitude), 2),
-                frequency=round(freq, 1),
-                cents_deviation=cents_dev
-            ))
-        engine_name = "Spotify Basic Pitch"
-        # Continuous pitch contour
-        _, pitch_frames = run_yin_transcription(y, sr)
-    except Exception:
-        # Robust YIN + Onset Segmentation
-        notes, pitch_frames = run_yin_transcription(y, sr)
-        engine_name = "DSP YIN & Onset Tracker"
+    # Use High-Precision DSP YIN & Onset Segmentation for mathematical pitch fidelity
+    notes, pitch_frames = run_yin_transcription(y, sr)
+    engine_name = "DSP YIN & Onset Tracker"
 
     conf_overall = round(float(np.mean([n.confidence for n in notes])), 2) if notes else 0.0
 

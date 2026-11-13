@@ -61,10 +61,20 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     perf_times = np.array([f.time for f in valid_frames], dtype=np.float64)
     perf_midis = np.array([f.midi for f in valid_frames], dtype=np.float64)
 
-    # 2. Constrained Global Latency / Alignment Search (-250ms to +250ms)
+    # 2. Constrained Global Latency / Alignment Search (-100ms to +100ms)
+    # Tightly bounded to realistic acoustic latency to prevent jumping across musical note boundaries
+    candidate_offsets = np.linspace(-0.10, 0.10, 41)  # 5ms steps
     best_offset = 0.0
     best_cost = float("inf")
-    candidate_offsets = np.linspace(-0.25, 0.25, 51)  # 10ms steps
+
+    # Determine maximum valid note overlap across candidate offsets
+    max_overlap = 0
+    for off in candidate_offsets:
+        cnt = 0
+        for n in ref_notes:
+            cnt += int(np.sum((perf_times >= n.start + off) & (perf_times <= n.end + off)))
+        if cnt > max_overlap:
+            max_overlap = cnt
 
     for off in candidate_offsets:
         cost_sum = 0.0
@@ -77,10 +87,11 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
                 oct_diff = np.minimum(raw_diff, np.minimum(np.abs(raw_diff - 12.0), np.abs(raw_diff + 12.0)))
                 cost_sum += float(np.sum(oct_diff))
                 overlap_count += int(np.sum(mask))
-        if overlap_count > 0:
-            avg_cost = cost_sum / overlap_count
-            if avg_cost < best_cost:
-                best_cost = avg_cost
+        if overlap_count >= max(1, int(max_overlap * 0.80)):
+            # Regularized cost: strictly penalizes unnecessary shifts away from 0ms
+            reg_cost = (cost_sum / overlap_count) + abs(off) * 2.5
+            if reg_cost < best_cost:
+                best_cost = reg_cost
                 best_offset = float(off)
 
     aligned_times = perf_times - best_offset
