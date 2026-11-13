@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { Award, CheckCircle, XCircle, ArrowRight, RotateCcw, X } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import type { EvaluationResponse } from '../types';
@@ -14,8 +14,11 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
   onClose,
   onRetry,
 }) => {
+  const hasFiredConfetti = useRef(false);
+
   useEffect(() => {
-    if (evaluation.overall_score >= 70) {
+    if (evaluation.overall_score >= 70 && !hasFiredConfetti.current) {
+      hasFiredConfetti.current = true;
       confetti({
         particleCount: 80,
         spread: 70,
@@ -23,7 +26,9 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
         colors: ['#06b6d4', '#38bdf8', '#10b981', '#f59e0b'],
       });
     }
+  }, [evaluation.overall_score]);
 
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         onClose();
@@ -31,7 +36,7 @@ export const EvaluationModal: React.FC<EvaluationModalProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [evaluation.overall_score, onClose]);
+  }, [onClose]);
 
   const getScoreColor = (score: number) => {
     if (score >= 80) return 'text-emerald-400 border-emerald-500/50 bg-emerald-950/40';
