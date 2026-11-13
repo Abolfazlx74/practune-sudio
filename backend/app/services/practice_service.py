@@ -56,6 +56,16 @@ def extract_instrument_main_notes(notes: List[NoteItem]) -> List[NoteItem]:
 
     return merged
 
+def extract_vocal_main_notes(notes: List[NoteItem]) -> List[NoteItem]:
+    """
+    Filters ultra-short inter-syllable pitch glides (< 85ms) in Vocal/Quran mode
+    so natural transitions between words do not cause artificial score drops.
+    """
+    if len(notes) <= 1:
+        return notes
+    filtered = [n for n in notes if (n.end - n.start) >= 0.085]
+    return filtered if filtered else notes
+
 def extract_notes_from_pitch_frames(frames: List[PitchFrame]) -> List[NoteItem]:
     """
     Transforms a performance pitch contour (from a recorded practice take)
@@ -129,10 +139,10 @@ def extract_notes_from_pitch_frames(frames: List[PitchFrame]) -> List[NoteItem]:
 def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     """
     High-Precision Musical Performance Evaluator:
-    - Dedicated modes: Instrument Mode (pure discrete main notes, transition-immune) and Vocal Mode (continuous vocal intonation & vibrato).
+    - Dedicated modes: Instrument Mode (pure discrete main notes, transition-immune) and Vocal Mode (balanced vocal intonation & vibrato).
     - Constrained time alignment for acoustic / mic latency compensation (±250ms).
     - Non-bleeding note windowing to prevent adjacent notes from corrupting pitch accuracy.
-    - Pitch accuracy measured in cents with vocal vibrato tolerance (50¢ standard, 60¢ vocal, 70¢ instrument).
+    - Pitch accuracy measured in cents with natural vocal vibrato tolerance.
     - Octave jump disambiguation (supports male/female register octave shifts & instrument registers).
     - Onset timing accuracy with natural human perception thresholds.
     - Note coverage: tracks missed notes vs hit notes.
@@ -142,10 +152,10 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     if studio_type == "instrument":
         ref_notes = extract_instrument_main_notes(req.reference_notes)
     else:
-        ref_notes = req.reference_notes
+        ref_notes = extract_vocal_main_notes(req.reference_notes)
 
     perf_pitches = req.performance_pitches
-    tol_cents = max(40.0, float(req.tolerance_cents or (70.0 if studio_type == "instrument" else 50.0)))
+    tol_cents = max(40.0, float(req.tolerance_cents or (70.0 if studio_type == "instrument" else 65.0)))
 
     if not ref_notes:
         return EvaluationResponse(
@@ -336,12 +346,10 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     perf_midis = np.array([f.midi for f in valid_frames], dtype=np.float64)
 
     # 2. Constrained Global Latency / Alignment Search (-250ms to +250ms)
-    # Broad enough to capture browser/headphone latency, regularized to prevent jumping musical note boundaries
     candidate_offsets = np.linspace(-0.25, 0.25, 101)  # 5ms steps
     best_offset = 0.0
     best_cost = float("inf")
 
-    # Determine maximum valid note overlap across candidate offsets
     max_overlap = 0
     for off in candidate_offsets:
         cnt = 0
@@ -357,12 +365,10 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             mask = (perf_times >= n.start + off) & (perf_times <= n.end + off)
             if np.any(mask):
                 raw_diff = np.abs(perf_midis[mask] - n.midi)
-                # Octave-invariant minimum difference
                 oct_diff = np.minimum(raw_diff, np.minimum(np.abs(raw_diff - 12.0), np.abs(raw_diff + 12.0)))
                 cost_sum += float(np.sum(oct_diff))
                 overlap_count += int(np.sum(mask))
         if overlap_count >= max(1, int(max_overlap * 0.85)):
-            # Regularized cost: penalizes unnecessary shifts away from 0ms while allowing real latency alignment
             reg_cost = (cost_sum / overlap_count) + abs(off) * 0.5
             if reg_cost < best_cost:
                 best_cost = reg_cost
@@ -370,7 +376,7 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
 
     aligned_times = perf_times - best_offset
 
-    # 3. Check for Global Octave Transposition (e.g. female singing male vocal track or vice versa)
+    # 3. Check for Global Octave Transposition
     overlapping_diffs = []
     for n in ref_notes:
         mask = (aligned_times >= n.start) & (aligned_times <= n.end)
@@ -401,10 +407,8 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
         prev_end = ref_notes[i - 1].end if i > 0 else 0.0
         next_start = ref_notes[i + 1].start if i < num_notes - 1 else float("inf")
 
-        # Boundary without leaking into neighbor notes:
-        # Extend at most 40ms or halfway to the adjacent note
-        win_start = max(note.start - 0.04, (prev_end + note.start) / 2.0 if prev_end < note.start else prev_end)
-        win_end = min(note.end + 0.04, (note.end + next_start) / 2.0 if next_start > note.end else next_start)
+        win_start = max(note.start - 0.05, (prev_end + note.start) / 2.0 if prev_end < note.start else prev_end)
+        win_end = min(note.end + 0.05, (note.end + next_start) / 2.0 if next_start > note.end else next_start)
 
         mask = (aligned_times >= win_start) & (aligned_times <= win_end)
 
@@ -467,14 +471,14 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
         # Target reference pitch (accurate to fractions of a cent)
         ref_pitch_target = note.midi + (getattr(note, "cents_deviation", 0.0) / 100.0)
 
-        # Transition-aware filtering: isolate stable note core frames (exclude boundary attack/release slides)
+        # Transition-aware filtering: isolate stable note core frames
         stable_core_midis = []
         transitions = getattr(req, "transitions", None) or []
         dur = note.end - note.start
-        eff_tolerance = max(tol_cents, 70.0 if studio_type == "instrument" else 55.0)
+        eff_tolerance = max(tol_cents, 70.0 if studio_type == "instrument" else 65.0)
 
         if studio_type == "instrument":
-            # Instrument Mode: Isolate stable body of the note, excluding attack/release transients & transition slides
+            # Instrument Mode: Isolate stable body of the note
             attack_margin = min(0.08, dur * 0.25)
             release_margin = min(0.06, dur * 0.20)
 
@@ -509,7 +513,6 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
 
             pitch_scores_list.append(pitch_score)
 
-            # Timing score for instrument: 90ms attack perception window
             onset_diff_ms = abs(matched_times[0] - note.start) * 1000.0
             if onset_diff_ms <= 90.0:
                 timing_score = 100.0
@@ -520,9 +523,9 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             if is_hit:
                 notes_hit_count += 1
         else:
-            # Vocal Mode: continuous cents intonation and vibrato evaluation
-            attack_margin = min(0.04, dur * 0.20)
-            release_margin = min(0.04, dur * 0.20)
+            # Vocal / Quran Mode: Balanced intonation & vibrato scoring (no double-penalty)
+            attack_margin = min(0.06, dur * 0.22)
+            release_margin = min(0.05, dur * 0.20)
 
             for mid_val, t_val in zip(core_midis, matched_times[core_mask]):
                 in_transition = any(tr.start <= t_val <= tr.end for tr in transitions)
@@ -538,24 +541,24 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             cents_err = (med_user_midi - ref_pitch_target) * 100.0
             all_cents_errors.append(cents_err)
 
-            # In-tune ratio (cents deviation within tolerance, with generous allowance for expressive vibrato)
-            eff_tolerance = max(tol_cents, 55.0)
             cents_diffs = np.abs(stable_core_midis - ref_pitch_target) * 100.0
             in_tune_ratio = float(np.mean(cents_diffs <= eff_tolerance))
 
-            # Pitch score for note:
-            # Full 100 if pitch center is within 15 cents; degrades smoothly beyond that
-            pitch_score = max(0.0, 100.0 - max(0.0, abs(cents_err) - 15.0) * 1.5) * (0.30 + 0.70 * in_tune_ratio)
-            pitch_score = min(100.0, pitch_score)
+            # Full 100 within ±25 cents (natural vocal vibrato); single smooth linear decay beyond
+            center_score = max(0.0, 100.0 - max(0.0, abs(cents_err) - 25.0) * 1.1)
+            frame_score = in_tune_ratio * 100.0
+            pitch_score = min(100.0, 0.65 * center_score + 0.35 * frame_score)
             pitch_scores_list.append(pitch_score)
 
-            # Timing score for note:
-            # Onset difference with 75ms acoustic perception window
+            # Timing score for vocal: 110ms natural consonant/breath onset window
             onset_diff_ms = abs(matched_times[0] - note.start) * 1000.0
-            timing_score = max(0.0, 100.0 - max(0.0, onset_diff_ms - 75.0) / 2.5)
+            if onset_diff_ms <= 110.0:
+                timing_score = 100.0
+            else:
+                timing_score = max(40.0, 100.0 - max(0.0, onset_diff_ms - 110.0) / 2.2)
             timing_scores_list.append(timing_score)
 
-            is_hit = abs(cents_err) <= eff_tolerance and pitch_score >= 45.0
+            is_hit = abs(cents_err) <= eff_tolerance and pitch_score >= 55.0
             if is_hit:
                 notes_hit_count += 1
 
@@ -579,7 +582,7 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
                 feedback_items.append(f"Note {note.note_name} ({note.start:.1f}s) was ~{abs(cents_err):.0f}¢ flat (too low).")
             elif cents_err > eff_tolerance:
                 feedback_items.append(f"Note {note.note_name} ({note.start:.1f}s) was ~{cents_err:.0f}¢ sharp (too high).")
-        elif onset_diff_ms > 140.0:
+        elif onset_diff_ms > 150.0:
             if (matched_times[0] - note.start) > 0:
                 feedback_items.append(f"Note {note.note_name} entered ~{onset_diff_ms:.0f}ms late.")
             else:
@@ -611,12 +614,9 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     timing_accuracy = round(float(np.mean(timing_scores_list)), 1) if timing_scores_list else 0.0
     note_coverage = round(float((notes_hit_count / num_notes) * 100.0), 1)
 
-    # Sequence Accuracy (Levenshtein / In-order progression of hit notes)
     sequence_accuracy = round(float((notes_hit_count / max(1, detected_live_segments)) * 100.0), 1)
     sequence_accuracy = min(100.0, sequence_accuracy)
 
-    # Transparent Weighted Overall Score (Direct weighted average of the 4 sub-metrics):
-    # 40% Pitch Accuracy, 30% Timing Accuracy, 20% Note Coverage, 10% Sequence Accuracy
     raw_overall = (
         0.40 * pitch_accuracy
         + 0.30 * timing_accuracy

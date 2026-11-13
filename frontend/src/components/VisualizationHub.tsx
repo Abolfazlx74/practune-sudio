@@ -24,6 +24,7 @@ import { SheetMusicView } from './SheetMusicView';
 import { PitchTimeline } from './PitchTimeline';
 import { PitchCorrectionControls } from './PitchCorrectionControls';
 import { SmartMetronome } from './SmartMetronome';
+import type { MetronomeGridState } from './SmartMetronome';
 
 interface VisualizationHubProps {
   transcription: TranscriptionResult;
@@ -47,11 +48,51 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
   const [isLooping, setIsLooping] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+  const [metronomeGrid, setMetronomeGrid] = useState<MetronomeGridState>({
+    enabled: false,
+    bpm: transcription.bpm || 120,
+    timeSignature: '4/4',
+    anchorTime: transcription.notes[0]?.start ?? 0,
+  });
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const animRef = useRef<number | null>(null);
+  const isLoopingRef = useRef<boolean>(false);
+  const inBarTailRef = useRef<boolean>(false);
+  const tailTimeRef = useRef<number>(0);
+  const tailLastPerfRef = useRef<number>(0);
 
-  const duration = transcription.duration || audioInfo.duration || 10;
+  useEffect(() => {
+    isLoopingRef.current = isLooping;
+  }, [isLooping]);
+
+  const rawDuration = transcription.duration || audioInfo.duration || 10;
+
+  // Calculate bar-aligned loop end time so metronome completes the final measure cleanly before repeating
+  const loopEndDuration = React.useMemo(() => {
+    if (!isLooping || !metronomeGrid.enabled || metronomeGrid.bpm <= 0) {
+      return rawDuration;
+    }
+    const beatDur = 60.0 / metronomeGrid.bpm;
+    const beatsPerBar =
+      metronomeGrid.timeSignature === '3/4'
+        ? 3
+        : metronomeGrid.timeSignature === '6/8'
+        ? 6
+        : metronomeGrid.timeSignature === '2/4'
+        ? 2
+        : 4;
+    const barDur = beatDur * beatsPerBar;
+    const elapsed = Math.max(0.1, rawDuration - metronomeGrid.anchorTime);
+    const totalBars = Math.ceil((elapsed - 0.04) / barDur);
+    return Math.round((metronomeGrid.anchorTime + totalBars * barDur) * 1000) / 1000;
+  }, [isLooping, metronomeGrid, rawDuration]);
+
+  const duration = loopEndDuration;
+  const loopEndRef = useRef<number>(loopEndDuration);
+  useEffect(() => {
+    loopEndRef.current = loopEndDuration;
+  }, [loopEndDuration]);
 
   // Sync mute state
   useEffect(() => {
@@ -81,7 +122,7 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isPlaying]);
 
-  // Smooth 60 FPS playhead synchronization
+  // Smooth 60 FPS playhead & bar-aligned loop tail synchronization
   useEffect(() => {
     if (!isPlaying) {
       if (animRef.current) cancelAnimationFrame(animRef.current);
@@ -89,7 +130,26 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
     }
 
     const updatePlayhead = () => {
-      if (audioRef.current) {
+      if (inBarTailRef.current) {
+        const now = performance.now();
+        const dt = ((now - tailLastPerfRef.current) / 1000) * playbackSpeed;
+        tailLastPerfRef.current = now;
+        tailTimeRef.current += dt;
+
+        if (tailTimeRef.current >= loopEndRef.current) {
+          inBarTailRef.current = false;
+          if (audioRef.current && isLoopingRef.current) {
+            audioRef.current.currentTime = 0;
+            setCurrentTime(0);
+            audioRef.current.play().catch(console.error);
+          } else {
+            setIsPlaying(false);
+            setCurrentTime(0);
+          }
+        } else {
+          setCurrentTime(tailTimeRef.current);
+        }
+      } else if (audioRef.current) {
         setCurrentTime(audioRef.current.currentTime);
       }
       animRef.current = requestAnimationFrame(updatePlayhead);
@@ -99,15 +159,17 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
-  }, [isPlaying]);
+  }, [isPlaying, playbackSpeed]);
 
   const togglePlay = async () => {
     if (!audioRef.current) return;
     if (isPlaying) {
+      inBarTailRef.current = false;
       audioRef.current.pause();
       setIsPlaying(false);
     } else {
       try {
+        inBarTailRef.current = false;
         audioRef.current.playbackRate = playbackSpeed;
         audioRef.current.preservesPitch = true;
         audioRef.current.muted = isMuted;
@@ -120,6 +182,7 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
   };
 
   const handleStop = () => {
+    inBarTailRef.current = false;
     if (!audioRef.current) return;
     audioRef.current.pause();
     audioRef.current.currentTime = 0;
@@ -128,7 +191,8 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
   };
 
   const handleSeek = (time: number) => {
-    const clamped = Math.max(0, Math.min(duration, time));
+    inBarTailRef.current = false;
+    const clamped = Math.max(0, Math.min(rawDuration, time));
     setCurrentTime(clamped);
     if (audioRef.current) {
       audioRef.current.currentTime = clamped;
@@ -157,15 +221,28 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
         ref={audioRef}
         src={getAudioFileUrl(audioInfo.id)}
         onEnded={() => {
-          if (isLooping && audioRef.current) {
-            audioRef.current.currentTime = 0;
-            audioRef.current.play();
+          if (isLoopingRef.current && audioRef.current) {
+            if (loopEndRef.current > rawDuration + 0.04) {
+              // Keep isPlaying=true and advance silently until the end of the musical bar so metronome stays on-beat
+              inBarTailRef.current = true;
+              tailTimeRef.current = rawDuration;
+              tailLastPerfRef.current = performance.now();
+            } else {
+              audioRef.current.currentTime = 0;
+              setCurrentTime(0);
+              audioRef.current.play().catch(console.error);
+            }
           } else {
+            inBarTailRef.current = false;
             setIsPlaying(false);
             setCurrentTime(0);
           }
         }}
-        onPause={() => setIsPlaying(false)}
+        onPause={() => {
+          if (!audioRef.current?.ended && !inBarTailRef.current) {
+            setIsPlaying(false);
+          }
+        }}
         preload="auto"
       />
 
@@ -305,7 +382,7 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
                 ? 'bg-cyan-950/80 border-cyan-600 text-cyan-300'
                 : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
             }`}
-            title={isLooping ? "Continuous Loop Enabled" : "Enable Continuous Loop"}
+            title={isLooping ? "Continuous Bar-Aligned Loop Enabled" : "Enable Continuous Loop"}
           >
             <Repeat className="w-4 h-4" />
           </button>
@@ -375,6 +452,7 @@ export const VisualizationHub: React.FC<VisualizationHubProps> = ({
         currentTime={currentTime}
         playbackSpeed={playbackSpeed}
         defaultEnabled={false}
+        onGridChange={setMetronomeGrid}
       />
 
       {/* View Sub-Tabs (Piano Roll / Sheet Music / Pitch Timeline) */}

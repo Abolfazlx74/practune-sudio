@@ -50,6 +50,8 @@ export const SmartMetronome: React.FC<SmartMetronomeProps> = ({
   const [previewTick, setPreviewTick] = useState<boolean>(false);
 
   const lastBeatIndexRef = useRef<number | null>(null);
+  const prevTimeRef = useRef<number>(0);
+  const lastTriggerWallTimeRef = useRef<number>(0);
   const tapTimesRef = useRef<number[]>([]);
   const flashTimeoutRef = useRef<number | null>(null);
 
@@ -100,36 +102,47 @@ export const SmartMetronome: React.FC<SmartMetronomeProps> = ({
     }, 130);
   };
 
-  // Mode A: Synchronized playback tracking (locks to audio timeline & tempo)
+  // Mode A: Synchronized playback tracking (locks to audio timeline & loop restarts cleanly)
   useEffect(() => {
     if (!enabled || !isPlaying) {
       lastBeatIndexRef.current = null;
+      prevTimeRef.current = currentTime;
       return;
     }
 
-    // In auto mode, beat duration is in track-time (automatically scales with playbackSpeed!)
-    // In manual mode, convert wall-clock manual BPM into track-time units
+    // Detect backward loop jump or seek so beat counter resets cleanly
+    if (currentTime < prevTimeRef.current - 0.15) {
+      lastBeatIndexRef.current = null;
+    }
+    prevTimeRef.current = currentTime;
+
     const trackTimeBeatDur =
       syncMode === 'auto'
         ? 60.0 / Math.max(30, baseBpm)
         : (60.0 / Math.max(30, manualBpm)) * playbackSpeed;
 
     const relTime = currentTime - anchorTime;
-    if (relTime < -0.02) {
+    if (relTime < -0.005) {
       lastBeatIndexRef.current = null;
       return;
     }
 
-    const currentBeatCounter = Math.floor((relTime + 0.015) / trackTimeBeatDur);
+    const currentBeatCounter = Math.max(0, Math.floor((relTime + 0.002) / trackTimeBeatDur));
 
-    if (lastBeatIndexRef.current === null) {
-      lastBeatIndexRef.current = currentBeatCounter;
-      const beatInBar = ((currentBeatCounter % beatsPerBar) + beatsPerBar) % beatsPerBar;
-      triggerBeatPulse(beatInBar);
-    } else if (currentBeatCounter !== lastBeatIndexRef.current) {
-      lastBeatIndexRef.current = currentBeatCounter;
-      const beatInBar = ((currentBeatCounter % beatsPerBar) + beatsPerBar) % beatsPerBar;
-      triggerBeatPulse(beatInBar);
+    if (lastBeatIndexRef.current !== currentBeatCounter) {
+      const nowPerf = performance.now();
+      const wallBeatMs = (trackTimeBeatDur / Math.max(0.25, playbackSpeed)) * 1000;
+      const minGapMs = wallBeatMs * 0.55;
+
+      // Prevent duplicate click at exact loop-end boundary right before wrap to 0
+      if (nowPerf - lastTriggerWallTimeRef.current >= minGapMs) {
+        lastBeatIndexRef.current = currentBeatCounter;
+        lastTriggerWallTimeRef.current = nowPerf;
+        const beatInBar = ((currentBeatCounter % beatsPerBar) + beatsPerBar) % beatsPerBar;
+        triggerBeatPulse(beatInBar);
+      } else {
+        lastBeatIndexRef.current = currentBeatCounter;
+      }
     }
   }, [enabled, isPlaying, currentTime, syncMode, baseBpm, manualBpm, playbackSpeed, anchorTime, beatsPerBar, timeSignature]);
 

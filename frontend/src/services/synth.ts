@@ -70,25 +70,74 @@ class WebAudioSynth {
     if (!this.ctx) return;
 
     const now = this.ctx.currentTime;
-    const osc = this.ctx.createOscillator();
-    const gain = this.ctx.createGain();
 
-    const freq = accent === 'downbeat' ? 1320 : accent === 'secondary' ? 990 : 780;
+    // Acoustic woodblock resonant cavity frequencies (fundamental + hollow wooden overtone)
+    const f1 = accent === 'downbeat' ? 1140 : accent === 'secondary' ? 920 : 810;
+    const f2 = f1 * 1.56;
     const peakGain = accent === 'downbeat' ? 0.38 : accent === 'secondary' ? 0.26 : 0.22;
 
-    osc.type = 'triangle';
-    osc.frequency.setValueAtTime(freq, now);
-    osc.frequency.exponentialRampToValueAtTime(freq * 0.55, now + 0.045);
+    const oscBody = this.ctx.createOscillator();
+    const oscOvertone = this.ctx.createOscillator();
+    const bodyGain = this.ctx.createGain();
+    const overtoneGain = this.ctx.createGain();
+    const woodFilter = this.ctx.createBiquadFilter();
 
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.linearRampToValueAtTime(peakGain, now + 0.004);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+    oscBody.type = 'sine';
+    oscBody.frequency.setValueAtTime(f1 * 1.06, now);
+    oscBody.frequency.exponentialRampToValueAtTime(f1, now + 0.008);
 
-    osc.connect(gain);
-    gain.connect(this.ctx.destination);
+    oscOvertone.type = 'triangle';
+    oscOvertone.frequency.setValueAtTime(f2 * 1.05, now);
+    oscOvertone.frequency.exponentialRampToValueAtTime(f2, now + 0.006);
 
-    osc.start(now);
-    osc.stop(now + 0.06);
+    woodFilter.type = 'bandpass';
+    woodFilter.frequency.setValueAtTime(f1 * 1.25, now);
+    woodFilter.Q.setValueAtTime(2.2, now);
+
+    // Tight percussive wood envelope (~42ms)
+    bodyGain.gain.setValueAtTime(0.0001, now);
+    bodyGain.gain.linearRampToValueAtTime(peakGain, now + 0.002);
+    bodyGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.044);
+
+    overtoneGain.gain.setValueAtTime(0.0001, now);
+    overtoneGain.gain.linearRampToValueAtTime(peakGain * 0.45, now + 0.0015);
+    overtoneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.024);
+
+    oscBody.connect(woodFilter);
+    oscOvertone.connect(overtoneGain);
+    overtoneGain.connect(woodFilter);
+    woodFilter.connect(bodyGain);
+    bodyGain.connect(this.ctx.destination);
+
+    // Short wooden mallet strike transient
+    const clickLen = Math.floor(this.ctx.sampleRate * 0.01);
+    const clickBuf = this.ctx.createBuffer(1, clickLen, this.ctx.sampleRate);
+    const chData = clickBuf.getChannelData(0);
+    for (let i = 0; i < clickLen; i++) {
+      chData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (clickLen * 0.25));
+    }
+    const noiseSrc = this.ctx.createBufferSource();
+    noiseSrc.buffer = clickBuf;
+
+    const malletFilter = this.ctx.createBiquadFilter();
+    malletFilter.type = 'bandpass';
+    malletFilter.frequency.setValueAtTime(2400, now);
+    malletFilter.Q.setValueAtTime(3.0, now);
+
+    const malletGain = this.ctx.createGain();
+    malletGain.gain.setValueAtTime(peakGain * 0.55, now);
+    malletGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.01);
+
+    noiseSrc.connect(malletFilter);
+    malletFilter.connect(malletGain);
+    malletGain.connect(this.ctx.destination);
+
+    oscBody.start(now);
+    oscOvertone.start(now);
+    noiseSrc.start(now);
+
+    oscBody.stop(now + 0.05);
+    oscOvertone.stop(now + 0.03);
   }
 }
 

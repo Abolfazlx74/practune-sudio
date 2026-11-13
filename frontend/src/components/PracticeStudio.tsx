@@ -132,39 +132,70 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     return { ...n, midi: newMidi, octave, note_name: name };
   });
 
-  // De-spiked & Smoothed Continuous F0 Contour (9-point Median Filter + Gaussian Smooth)
+  // De-spiked, Octave-Tower-Suppressed & Smoothed Continuous F0 Contour (matches reference video style)
   const rawContour: PitchFrame[] = React.useMemo(() => {
     const source: PitchFrame[] =
       (transcription as any).pitch_contour || (transcription as any).f0_contour || [];
     if (source.length === 0) return [];
 
-    // Step 1: 9-point Median Filter to strip harmonic spikes & background noise glitches
-    const despiked: PitchFrame[] = source.map((curr, idx) => {
+    // Step 1: Octave-jump & harmonic tower suppression using a ±0.50s local register window
+    const registerCleaned: PitchFrame[] = source.map((curr, idx) => {
       if (curr.midi <= 0 || (curr.confidence !== undefined && curr.confidence < 0.25)) {
         return { ...curr, midi: 0 };
       }
+      const localVals: number[] = [];
+      for (let k = 0; k < source.length; k++) {
+        const nb = source[k];
+        if (nb.time < curr.time - 0.50) continue;
+        if (nb.time > curr.time + 0.50) break;
+        if (nb.midi > 0 && (nb.confidence === undefined || nb.confidence >= 0.25)) {
+          localVals.push(nb.midi);
+        }
+      }
+      if (localVals.length < 3) {
+        return { ...curr, midi: 0 };
+      }
+      localVals.sort((a, b) => a - b);
+      const localMed = localVals[Math.floor(localVals.length / 2)];
+      let m = curr.midi;
+
+      // Fold back harmonic octave / fifth spikes (e.g. +7 or +12 semitone square towers)
+      if (m - localMed >= 6.0) {
+        const foldedOctave = m - 12.0;
+        if (Math.abs(foldedOctave - localMed) <= 3.5) {
+          m = foldedOctave;
+        } else {
+          m = localMed;
+        }
+      } else if (localMed - m >= 6.0) {
+        const foldedUp = m + 12.0;
+        if (Math.abs(foldedUp - localMed) <= 3.5) {
+          m = foldedUp;
+        } else {
+          m = localMed;
+        }
+      }
+      return { ...curr, midi: m };
+    });
+
+    // Step 2: 11-point Median Filter for clean melodic contour
+    const despiked: PitchFrame[] = registerCleaned.map((curr, idx) => {
+      if (curr.midi <= 0) return { ...curr, midi: 0 };
       const windowVals: number[] = [];
-      for (let k = Math.max(0, idx - 4); k <= Math.min(source.length - 1, idx + 4); k++) {
-        const neighbor = source[k];
-        if (
-          neighbor.midi > 0 &&
-          (neighbor.confidence === undefined || neighbor.confidence >= 0.25) &&
-          Math.abs(neighbor.time - curr.time) <= 0.22
-        ) {
+      for (let k = Math.max(0, idx - 5); k <= Math.min(registerCleaned.length - 1, idx + 5); k++) {
+        const neighbor = registerCleaned[k];
+        if (neighbor.midi > 0 && Math.abs(neighbor.time - curr.time) <= 0.25) {
           windowVals.push(neighbor.midi);
         }
       }
-      if (windowVals.length < 3) {
-        return { ...curr, midi: 0 };
-      }
+      if (windowVals.length < 3) return { ...curr, midi: 0 };
       windowVals.sort((a, b) => a - b);
-      const medianMidi = windowVals[Math.floor(windowVals.length / 2)];
-      return { ...curr, midi: medianMidi };
+      return { ...curr, midi: windowVals[Math.floor(windowVals.length / 2)] };
     });
 
-    // Step 2: Weighted Gaussian smoothing over voiced segments
+    // Step 3: Gaussian smoothing over continuous voiced phrases
     const smoothed: PitchFrame[] = [];
-    const weights = [0.08, 0.14, 0.22, 0.28, 0.22, 0.14, 0.08];
+    const weights = [0.06, 0.12, 0.20, 0.24, 0.20, 0.12, 0.06];
     for (let i = 0; i < despiked.length; i++) {
       const curr = despiked[i];
       if (curr.midi <= 0) {
@@ -178,7 +209,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         if (j >= 0 && j < despiked.length && despiked[j].midi > 0) {
           const dt = Math.abs(despiked[j].time - curr.time);
           const dm = Math.abs(despiked[j].midi - curr.midi);
-          if (dt <= 0.16 && dm <= 4.5) {
+          if (dt <= 0.16 && dm <= 4.0) {
             const w = weights[offset + 3];
             valSum += despiked[j].midi * w;
             wSum += w;
@@ -435,7 +466,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           practiceMode === 'note' && selectedNote
             ? [selectedNote]
             : effectiveNotes;
-        const tolerance = studioType === 'instrument' ? 70.0 : 55.0;
+        const tolerance = studioType === 'instrument' ? 70.0 : 65.0;
         const resp = await evaluatePractice(
           evalTargetNotes,
           userPitchHistory.current,
@@ -602,7 +633,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const hideReferenceGraph = blindMode && isPracticing;
 
     // =========================================================================
-    // VOCAL / QURAN MODE: Zoomed Scrolling Timeline with Centered Fixed Playhead
+    // VOCAL / QURAN MODE: Reference-Video Style Smooth Contour + Concentric Ring
     // =========================================================================
     if (studioType === 'vocal') {
       const leftMargin = 38;
@@ -616,7 +647,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       // 1. Subtle Horizontal Staff Lines & Left Note Axis
       for (let m = minMidi; m <= maxMidi; m++) {
         const y = midiToY(m);
-        ctx.strokeStyle = m % 12 === 0 ? 'rgba(51, 65, 85, 0.4)' : 'rgba(30, 41, 59, 0.22)';
+        ctx.strokeStyle = m % 12 === 0 ? 'rgba(51, 65, 85, 0.35)' : 'rgba(30, 41, 59, 0.18)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(leftMargin, y);
@@ -640,7 +671,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
       const history = userPitchHistory.current;
 
-      // 2. Single Main Reference Vocal Contour
+      // 2. Smooth Reference Vocal Contour (Ice-Blue ahead of cursor; Glowing Neon Green behind when matched)
       if (!hideReferenceGraph && rawContour.length > 1) {
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
@@ -648,7 +679,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         for (let i = 1; i < rawContour.length; i++) {
           const p1 = rawContour[i - 1];
           const p2 = rawContour[i];
-          if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.18) continue;
+          if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.22) continue;
 
           const x1 = timeToX(p1.time);
           const x2 = timeToX(p2.time);
@@ -657,15 +688,22 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           const y1 = midiToY(p1.midi);
           const y2 = midiToY(p2.midi);
 
-          const isMatched = isReferencePointMatchedByUser(p2.time, p2.midi, currentTime, history);
+          const isPassed = p2.time <= currentTime;
+          const isMatched = isPassed && isReferencePointMatchedByUser(p2.time, p2.midi, currentTime, history);
 
           if (isMatched) {
             ctx.strokeStyle = '#39ff14';
-            ctx.lineWidth = 5;
+            ctx.lineWidth = 4.5;
             ctx.shadowColor = '#39ff14';
-            ctx.shadowBlur = 12;
+            ctx.shadowBlur = 14;
+          } else if (isPassed) {
+            // Passed but not matched: dim slate-blue
+            ctx.strokeStyle = 'rgba(100, 116, 139, 0.30)';
+            ctx.lineWidth = 3;
+            ctx.shadowBlur = 0;
           } else {
-            ctx.strokeStyle = 'rgba(57, 255, 20, 0.26)';
+            // Upcoming path ahead of cursor: clean silver-blue guide like reference video
+            ctx.strokeStyle = 'rgba(125, 211, 252, 0.36)';
             ctx.lineWidth = 3.5;
             ctx.shadowBlur = 0;
           }
@@ -684,9 +722,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           if (nx < leftMargin || nx > width) return;
           const refY = getTargetMidiAtTime(n.start + 0.05) ?? n.midi;
           const ny = midiToY(refY);
-          ctx.fillStyle = 'rgba(134, 239, 172, 0.65)';
+          ctx.fillStyle = 'rgba(186, 230, 253, 0.65)';
           ctx.font = 'bold 9px monospace';
-          ctx.fillText(n.note_name, nx + 2, ny - 9);
+          ctx.fillText(n.note_name, nx + 2, ny - 10);
         });
       } else if (hideReferenceGraph) {
         ctx.fillStyle = 'rgba(148, 163, 184, 0.22)';
@@ -696,7 +734,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         ctx.textAlign = 'left';
       }
 
-      // 3. Off-Pitch User Trace
+      // 3. Off-Pitch User Trace (Smooth Coral-Red trace behind cursor where user deviated from melody)
       if (history.length > 1) {
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
@@ -704,7 +742,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         for (let i = 1; i < history.length; i++) {
           const p1 = history[i - 1];
           const p2 = history[i];
-          if (p2.time - p1.time > 0.18 || p2.time > currentTime) continue;
+          if (p2.time - p1.time > 0.20 || p2.time > currentTime) continue;
 
           const x1 = timeToX(p1.time);
           const x2 = timeToX(p2.time);
@@ -756,8 +794,15 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         ctx.fillText(`${t}s`, tx - 6, height - 6);
       }
 
-      // 5. Fixed Center Playhead Line & Live Pitch Ball Pointer
-      ctx.strokeStyle = 'rgba(248, 250, 252, 0.35)';
+      // 5. Fixed Center Playhead Beam & Concentric Live Pitch Ring Pointer
+      const beamGrad = ctx.createLinearGradient(centerX - 10, 0, centerX + 10, 0);
+      beamGrad.addColorStop(0, 'rgba(56, 189, 248, 0.0)');
+      beamGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.08)');
+      beamGrad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
+      ctx.fillStyle = beamGrad;
+      ctx.fillRect(centerX - 10, 0, 20, axisY);
+
+      ctx.strokeStyle = 'rgba(248, 250, 252, 0.30)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(centerX, 0);
@@ -783,18 +828,28 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         const ballColor =
           isPracticing && currentLive?.isVoiced
             ? (hideReferenceGraph ? '#38bdf8' : isPointerInTune ? '#39ff14' : '#ef4444')
-            : '#39ff14';
+            : '#38bdf8';
 
         ctx.save();
+        // Outer concentric halo ring
+        ctx.strokeStyle = ballColor;
+        ctx.globalAlpha = 0.45;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(centerX, ballY, 11, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Inner glowing core
+        ctx.globalAlpha = 1.0;
         ctx.fillStyle = ballColor;
         ctx.shadowColor = ballColor;
         ctx.shadowBlur = 14;
         ctx.beginPath();
-        ctx.arc(centerX, ballY, 6.5, 0, Math.PI * 2);
+        ctx.arc(centerX, ballY, 5.5, 0, Math.PI * 2);
         ctx.fill();
 
         ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 2;
+        ctx.lineWidth = 1.8;
         ctx.stroke();
         ctx.restore();
       }
@@ -809,7 +864,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       const badgeY = 6;
 
       ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-      ctx.strokeStyle = '#39ff14';
+      ctx.strokeStyle = '#38bdf8';
       ctx.lineWidth = 1.2;
       ctx.beginPath();
       ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
@@ -1545,9 +1600,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       {/* Dual Layer Real-time Pitch Canvas Container */}
       <div className="daw-panel p-4 border border-slate-800 bg-slate-900/50 rounded-2xl space-y-2 relative">
         <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-          <span className={`flex items-center gap-1.5 ${studioType === 'vocal' ? 'text-emerald-300' : 'text-cyan-300'}`}>
-            <span className={`w-3 h-2 rounded-xs ${studioType === 'vocal' ? 'bg-[#39ff14]/30 border border-[#39ff14]' : 'bg-cyan-500/30 border border-cyan-400'}`}></span>
-            {studioType === 'vocal' ? 'Main Vocal Contour (Lights up Bright Neon Green when matched)' : 'Incoming Notes -> Rectangular Gate'}
+          <span className={`flex items-center gap-1.5 ${studioType === 'vocal' ? 'text-sky-300' : 'text-cyan-300'}`}>
+            <span className={`w-3 h-2 rounded-xs ${studioType === 'vocal' ? 'bg-sky-400/30 border border-sky-400' : 'bg-cyan-500/30 border border-cyan-400'}`}></span>
+            {studioType === 'vocal' ? 'Upcoming Melody Contour (Turns Neon Green behind cursor when matched)' : 'Incoming Notes -> Rectangular Gate'}
           </span>
           <span className="flex items-center gap-1.5 text-rose-300">
             <span className="w-2.5 h-2.5 bg-rose-500 rounded-full"></span>
