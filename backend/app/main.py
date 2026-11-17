@@ -58,6 +58,7 @@ def root():
         }
     }
 
+@app.get("/health")
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "Practune API"}
@@ -122,9 +123,13 @@ def trim_audio_endpoint(audio_id: str, request: TrimRequest):
         raise HTTPException(status_code=500, detail=f"Trimming failed: {str(e)}")
 
 @app.post("/api/audio/{audio_id}/transcribe", response_model=TranscriptionResult)
-def run_transcription(audio_id: str):
+def run_transcription(
+    audio_id: str,
+    source_type: str = Query("instrument", description="Source audio domain: 'instrument' or 'vocal'"),
+    engine: Optional[str] = Query(None, description="Preferred engine: 'basic_pitch' or 'yin'")
+):
     try:
-        result = transcribe_audio(audio_id)
+        result = transcribe_audio(audio_id, source_type=source_type, engine=engine)
         return result
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Audio file not found")
@@ -132,12 +137,16 @@ def run_transcription(audio_id: str):
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 @app.get("/api/audio/{audio_id}/transcription", response_model=TranscriptionResult)
-def fetch_transcription(audio_id: str):
-    result = get_transcription(audio_id)
+def fetch_transcription(
+    audio_id: str,
+    source_type: str = Query("instrument"),
+    engine: Optional[str] = Query(None)
+):
+    result = get_transcription(audio_id, source_type=source_type, engine=engine)
     if not result:
         # If not cached yet, run transcription
         try:
-            return transcribe_audio(audio_id)
+            return transcribe_audio(audio_id, source_type=source_type, engine=engine)
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"Transcription not found: {str(e)}")
     return result

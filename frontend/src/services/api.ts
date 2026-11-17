@@ -59,8 +59,16 @@ export async function trimAudio(audioId: string, startTime: number, endTime: num
   return res.json();
 }
 
-export async function transcribeAudio(audioId: string): Promise<TranscriptionResult> {
-  const res = await fetch(`${API_BASE}/audio/${audioId}/transcribe`, {
+export async function transcribeAudio(
+  audioId: string,
+  sourceType: 'instrument' | 'vocal' = 'instrument',
+  engine?: 'basic_pitch' | 'yin'
+): Promise<TranscriptionResult> {
+  const params = new URLSearchParams({ source_type: sourceType });
+  if (engine) {
+    params.append('engine', engine);
+  }
+  const res = await fetch(`${API_BASE}/audio/${audioId}/transcribe?${params.toString()}`, {
     method: 'POST',
   });
 

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { Mic2, Sparkles } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import type { TabType } from './components/Navbar';
 import { Dashboard } from './components/Dashboard';
@@ -262,6 +263,32 @@ export function App() {
           />
         )}
 
+        {activeTab === 'visualization' && (!transcription || !audioInfo) && (
+          <div className="flex flex-col items-center justify-center p-12 text-center rounded-2xl border border-slate-800 bg-slate-900/40 my-12 max-w-xl mx-auto space-y-4">
+            <div className="w-16 h-16 rounded-2xl bg-cyan-950/60 border border-cyan-700/50 flex items-center justify-center text-cyan-400">
+              <Sparkles className="w-8 h-8" />
+            </div>
+            <h3 className="text-lg font-bold text-white">No Track Loaded for Analysis</h3>
+            <p className="text-sm text-slate-400 max-w-md">
+              Please upload and transcribe an audio file in the Audio Workspace or open an existing project from the Dashboard to view visual analysis.
+            </p>
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                onClick={() => setActiveTab('workspace')}
+                className="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold rounded-xl text-sm transition"
+              >
+                Go to Audio Workspace
+              </button>
+              <button
+                onClick={() => setActiveTab('dashboard')}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-xl text-sm transition"
+              >
+                Open Dashboard
+              </button>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'practice' && transcription && audioInfo && (
           <PracticeStudio
             transcription={transcription}
@@ -277,6 +304,32 @@ export function App() {
             }}
             onPracticeModified={() => setIsDirty(true)}
           />
+        )}
+
+        {activeTab === 'practice' && (!transcription || !audioInfo) && (
+          <div className="flex flex-col items-center justify-center p-12 text-center rounded-2xl border border-slate-800 bg-slate-900/40 my-12 max-w-xl mx-auto space-y-4">
+            <div className="w-16 h-16 rounded-2xl bg-cyan-950/60 border border-cyan-700/50 flex items-center justify-center text-cyan-400">
+              <Mic2 className="w-8 h-8" />
+            </div>
+            <h3 className="text-lg font-bold text-white">No Track Loaded for Practice</h3>
+            <p className="text-sm text-slate-400 max-w-md">
+              Please load an audio file in the Audio Workspace or open a saved project to start practicing in real-time.
+            </p>
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                onClick={() => setActiveTab('workspace')}
+                className="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold rounded-xl text-sm transition"
+              >
+                Go to Audio Workspace
+              </button>
+              <button
+                onClick={() => setActiveTab('dashboard')}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-xl text-sm transition"
+              >
+                Open Dashboard
+              </button>
+            </div>
+          </div>
         )}
 
         {activeTab === 'settings' && (

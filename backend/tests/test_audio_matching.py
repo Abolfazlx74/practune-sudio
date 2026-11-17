@@ -24,11 +24,10 @@ from app.services.practice_service import evaluate_performance
 
 
 def load_demo_reference():
-    from app.services.pitch_transcription import get_transcription
-    res = get_transcription("2ba782b5-c1d4-4031-ae0d-94a0a5047528")
-    if not res or not res.notes:
-        from app.services.pitch_transcription import transcribe_audio
-        res = transcribe_audio("2ba782b5-c1d4-4031-ae0d-94a0a5047528")
+    from app.services.pitch_transcription import get_transcription, transcribe_audio
+    res = get_transcription("2ba782b5-c1d4-4031-ae0d-94a0a5047528", source_type="vocal", engine="yin")
+    if not res or not res.notes or res.transcription_engine != "DSP YIN & Onset Tracker":
+        res = transcribe_audio("2ba782b5-c1d4-4031-ae0d-94a0a5047528", source_type="vocal", engine="yin")
     return res.notes, res.pitch_contour
 
 
@@ -355,6 +354,29 @@ def test_scenario_14_instrument_mode_missed_or_wrong_notes():
     print(">>> PASS: Instrument Mode evaluation with missed/off notes returns 200 OK without errors.")
 
 
+def test_scenario_15_spotify_basic_pitch_neural_transcription():
+    """15. Spotify Basic Pitch Neural Polyphonic Instrument Transcription."""
+    from app.services.pitch_transcription import run_basic_pitch_transcription
+    from app.services.dsp_utils import load_audio
+    from pathlib import Path
+
+    sample_path = Path(r"D:\practune samples\melodies\01_The_Godfather_Love_Theme_Acoustic_Guitar.mp3")
+    if not sample_path.exists():
+        print(">>> SKIP: Sample audio not found for Basic Pitch test.")
+        return
+
+    y, sr, dur = load_audio(str(sample_path), target_sr=22050)
+    notes, contour, transitions, vibratos, is_mono, warn = run_basic_pitch_transcription(sample_path, y, sr)
+
+    print("\n--- [TEST 15] Spotify Basic Pitch Neural Instrument Transcription ---")
+    print(f"Notes Count: {len(notes)} | Pitch Frames: {len(contour)} | Monophonic: {is_mono}")
+    print(f"Suitability/Polyphony Warning: {warn}")
+    assert len(notes) > 5, f"Expected > 5 notes from guitar sample, got {len(notes)}"
+    assert len(contour) > 20, f"Expected continuous contour frames, got {len(contour)}"
+    assert all(0 <= n.midi <= 127 for n in notes), "All notes must have valid MIDI range"
+    print(">>> PASS: Spotify Basic Pitch neural model extracted notes and polyphony successfully.")
+
+
 if __name__ == "__main__":
     print("=" * 65)
     print("PRACTUNE STUDIO AUDIO MATCHING & EVALUATION ACCURACY TEST SUITE")
@@ -373,6 +395,7 @@ if __name__ == "__main__":
     test_scenario_12_instrument_mode_transition_immunity()
     test_scenario_13_note_to_note_mode_evaluation()
     test_scenario_14_instrument_mode_missed_or_wrong_notes()
+    test_scenario_15_spotify_basic_pitch_neural_transcription()
     print("\n" + "=" * 65)
-    print("ALL 14 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
+    print("ALL 15 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 65)

@@ -29,14 +29,16 @@ export class MicPitchTracker {
   private isTracking = false;
   private history: LivePitchData[] = [];
   private onPitchCallback: ((data: LivePitchData) => void) | null = null;
+  private recentMidis: number[] = [];
 
   public async start(onPitch: (data: LivePitchData) => void): Promise<void> {
     this.stop();
     this.history = [];
+    this.recentMidis = [];
     this.onPitchCallback = onPitch;
 
     const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    this.audioCtx = new AudioContextClass();
+    this.audioCtx = new AudioContextClass({ latencyHint: 'interactive' });
 
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -49,6 +51,7 @@ export class MicPitchTracker {
     const source = this.audioCtx.createMediaStreamSource(this.mediaStream);
     this.analyser = this.audioCtx.createAnalyser();
     this.analyser.fftSize = 2048;
+    this.analyser.smoothingTimeConstant = 0.0; // Hard real-time without artificial delay
     source.connect(this.analyser);
 
     this.startTime = performance.now() / 1000;
@@ -92,20 +95,34 @@ export class MicPitchTracker {
 
     // YIN Pitch Detection
     const sampleRate = this.audioCtx.sampleRate;
-    const { freq, confidence } = this.yinDetect(buffer, sampleRate);
+    let { freq, confidence } = this.yinDetect(buffer, sampleRate);
 
-    // Gate threshold: sensitive enough to capture quiet acoustic instruments & voice, rejects silence/hiss (RMS < 0.007)
-    const isVoiced = rms > 0.007 && confidence > 0.48 && freq >= 55 && freq <= 1760;
+    // Dynamic voiced gate: sensitive for delicate acoustic instruments (rms > 0.004) while rejecting background hum/hiss
+    const isVoiced = (
+      ((rms > 0.004 && confidence > 0.55) || (rms > 0.007 && confidence > 0.44)) &&
+      freq >= 55 && freq <= 2200
+    );
 
     let midi = 0;
     let noteName = '--';
     let cents = 0;
 
     if (isVoiced) {
-      midi = 69 + 12 * Math.log2(freq / 440);
+      const rawMidi = 69 + 12 * Math.log2(freq / 440);
+      this.recentMidis.push(rawMidi);
+      if (this.recentMidis.length > 3) {
+        this.recentMidis.shift();
+      }
+      // 3-frame rolling median to eliminate 1-frame transient spikes and octave hops
+      const sorted = [...this.recentMidis].sort((a, b) => a - b);
+      midi = sorted[Math.floor(sorted.length / 2)];
+      freq = 440 * Math.pow(2, (midi - 69) / 12);
+
       const noteInfo = midiToNote(midi);
       noteName = noteInfo.noteName;
       cents = noteInfo.cents;
+    } else {
+      this.recentMidis = [];
     }
 
     const pitchData: LivePitchData = {
@@ -132,8 +149,8 @@ export class MicPitchTracker {
 
   private yinDetect(buffer: Float32Array, sampleRate: number): { freq: number; confidence: number } {
     const threshold = 0.15;
-    const minTau = Math.floor(sampleRate / 1200); // ~1200 Hz max
-    const maxTau = Math.floor(sampleRate / 65);   // ~65 Hz min
+    const minTau = Math.floor(sampleRate / 2200); // ~2200 Hz max (covers C7 / full instrument registers)
+    const maxTau = Math.floor(sampleRate / 60);   // ~60 Hz min (covers B1 / C2)
     const halfLen = Math.floor(buffer.length / 2);
 
     if (maxTau >= halfLen) {
@@ -188,14 +205,14 @@ export class MicPitchTracker {
       tauChosen = minIdx;
     }
 
-    // 4. Parabolic interpolation
+    // 4. Parabolic interpolation with convexity guard
     let betterTau = tauChosen;
     if (tauChosen > 0 && tauChosen < maxTau - 1) {
       const s0 = cmndf[tauChosen - 1];
       const s1 = cmndf[tauChosen];
       const s2 = cmndf[tauChosen + 1];
       const denom = 2 * (s0 - 2 * s1 + s2);
-      if (denom !== 0) {
+      if (denom > 0.0001) {
         betterTau = tauChosen + (s0 - s2) / denom;
       }
     }

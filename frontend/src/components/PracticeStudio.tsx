@@ -32,6 +32,8 @@ import { SmartHistoryModal } from './SmartHistoryModal';
 import { SmartMetronome } from './SmartMetronome';
 import type { MetronomeGridState } from './SmartMetronome';
 
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
 interface PracticeStudioProps {
   transcription: TranscriptionResult;
   audioId: string;
@@ -68,8 +70,23 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
 
-  // Studio Domain Mode (Vocal vs Instrument) & Blind Memory Mode
-  const [studioType, setStudioType] = useState<'vocal' | 'instrument'>('vocal');
+  // Studio Domain Mode (Vocal vs Instrument) with Basic Pitch Locking for Instruments
+  const uploadedSourceType = (typeof window !== 'undefined' ? localStorage.getItem('practune_source_type') : null) || 'instrument';
+  const instrumentEngine = (typeof window !== 'undefined' ? localStorage.getItem('practune_instrument_engine') : null) || 'basic_pitch';
+  const isInstrumentLocked = uploadedSourceType === 'instrument' && instrumentEngine === 'basic_pitch';
+
+  const [studioType, setStudioType] = useState<'vocal' | 'instrument'>(() => {
+    if (uploadedSourceType === 'instrument' && instrumentEngine === 'basic_pitch') {
+      return 'instrument';
+    }
+    return uploadedSourceType === 'vocal' ? 'vocal' : 'instrument';
+  });
+
+  useEffect(() => {
+    if (isInstrumentLocked && studioType !== 'instrument') {
+      setStudioType('instrument');
+    }
+  }, [isInstrumentLocked, studioType]);
   const [blindMode, setBlindMode] = useState<boolean>(false);
   const [showPostBlindAnalysis, setShowPostBlindAnalysis] = useState<boolean>(false);
 
@@ -639,6 +656,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   };
 
   const drawPracticeCanvas = () => {
+    try {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -930,159 +948,188 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
 
     // =========================================================================
-    // INSTRUMENT MODE: Scrolling Notes Moving Toward Rectangular Gate Pointer
+    // INSTRUMENT MODE: Interactive Piano Roll View (Synced to Analysis Style)
     // =========================================================================
-    const leftMargin = 38;
-    const plotWidth = width - leftMargin;
-    const gateX = leftMargin + plotWidth * 0.25;
-    const gateWidth = 22;
+    const PIANO_WIDTH = 54;
+    const plotWidth = width - PIANO_WIDTH;
+    const gateX = PIANO_WIDTH + plotWidth * 0.25;
     const pixelsPerSecond = 145;
 
+    const totalKeys = Math.max(12, midiRange + 1);
+    const keyHeight = Math.max(14, axisY / totalKeys);
+    const midiToY = (m: number) => (maxMidi - m) * keyHeight;
     const timeToX = (t: number) => gateX + (t - currentTime) * pixelsPerSecond;
-    const midiToY = (m: number) => height - ((m - minMidi) / midiRange) * (height - 48) - 34;
 
-    // 1. Horizontal Pitch Guides
-    for (let m = minMidi; m <= maxMidi; m++) {
-      const y = midiToY(m);
-      ctx.strokeStyle = m % 12 === 0 ? '#334155' : '#111827';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(leftMargin, y);
-      ctx.lineTo(width, y);
-      ctx.stroke();
-
-      const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-      const octave = Math.floor(m / 12);
-      ctx.fillStyle = m % 12 === 0 ? '#94a3b8' : '#475569';
-      ctx.font = '9px monospace';
-      ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
-    }
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(leftMargin, 0, plotWidth, axisY);
-    ctx.clip();
-
-    // Optional Metronome Beat Grid Lines
-    drawMetronomeBeatGrid(ctx, timeToX, leftMargin, width, axisY);
-
-    // 2. Incoming Note Blocks Scrolling Toward the Gate
+    // Detect live pitch & target match
     const currentLive = livePitchRef.current;
     let activeGateNote: NoteItem | null = null;
+    effectiveNotes.forEach((n) => {
+      if (currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08) {
+        activeGateNote = n;
+      }
+    });
 
-    if (!hideReferenceGraph) {
-      effectiveNotes.forEach((n, idx) => {
-        const x = timeToX(n.start);
-        const w = Math.max(16, n.duration * pixelsPerSecond);
-        if (x + w < leftMargin - 20 || x > width + 20) return;
+    const isLiveVoiced = isPracticing && !!currentLive?.isVoiced;
+    const isTargetHit = isLiveVoiced && !!activeGateNote && Math.abs(currentLive.midi - activeGateNote.midi) <= 0.70;
 
-        const y = midiToY(n.midi);
-        const isInsideGate = currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08;
-        if (isInsideGate) {
-          activeGateNote = n;
-        }
-        const isSelectedInNoteMode = practiceMode === 'note' && idx === selectedNoteIndex;
+    // 1. Draw Grid Rows & Left Piano Keyboard
+    for (let m = maxMidi; m >= minMidi; m--) {
+      const y = midiToY(m);
+      if (y + keyHeight < 0 || y > axisY) continue;
 
-        if (practiceMode === 'note') {
-          if (isSelectedInNoteMode) {
-            ctx.fillStyle = 'rgba(245, 158, 11, 0.45)';
-            ctx.strokeStyle = '#fbbf24';
-            ctx.lineWidth = 2.5;
-            ctx.shadowColor = '#f59e0b';
-            ctx.shadowBlur = 12;
-          } else {
-            ctx.fillStyle = 'rgba(14, 165, 233, 0.08)';
-            ctx.strokeStyle = 'rgba(14, 165, 233, 0.25)';
-            ctx.lineWidth = 1;
-            ctx.shadowBlur = 0;
-          }
-        } else {
-          ctx.fillStyle = isInsideGate ? 'rgba(56, 189, 248, 0.45)' : 'rgba(14, 165, 233, 0.22)';
-          ctx.strokeStyle = isInsideGate ? '#38bdf8' : 'rgba(14, 165, 233, 0.65)';
-          ctx.lineWidth = isInsideGate ? 2.2 : 1.2;
-          ctx.shadowBlur = isInsideGate ? 10 : 0;
-          ctx.shadowColor = '#38bdf8';
-        }
+      const noteIdx = ((m % 12) + 12) % 12;
+      const isBlack = [1, 3, 6, 8, 10].includes(noteIdx);
+      const isKeyActive = isLiveVoiced && Math.round(currentLive.midi) === m;
+      const isKeyTarget = activeGateNote && activeGateNote.midi === m;
 
-        ctx.beginPath();
-        ctx.roundRect(x, y, w, 18, 5);
-        ctx.fill();
-        ctx.stroke();
+      // Row background in DAW grid
+      ctx.fillStyle = isBlack ? '#0c1222' : '#0f172a';
+      ctx.fillRect(PIANO_WIDTH, y, width - PIANO_WIDTH, keyHeight);
+
+      // Horizontal grid line
+      ctx.strokeStyle = '#1e293b';
+      ctx.lineWidth = 0.5;
+      ctx.beginPath();
+      ctx.moveTo(PIANO_WIDTH, y + keyHeight);
+      ctx.lineTo(width, y + keyHeight);
+      ctx.stroke();
+
+      // Left Piano Key
+      if (isKeyActive) {
+        ctx.fillStyle = isTargetHit ? '#39ff14' : '#ef4444';
+        ctx.shadowColor = isTargetHit ? '#39ff14' : '#ef4444';
+        ctx.shadowBlur = 10;
+      } else if (isKeyTarget) {
+        ctx.fillStyle = '#0284c7';
         ctx.shadowBlur = 0;
-
-        ctx.fillStyle = isSelectedInNoteMode ? '#fef08a' : isInsideGate ? '#ffffff' : '#bae6fd';
-        ctx.font = 'bold 10px monospace';
-        ctx.fillText(n.note_name, x + 5, y + 12);
-      });
-    }
-
-    // 3. Rectangular Gate Pointer
-    let gateStroke = 'rgba(148, 163, 184, 0.55)';
-    let gateFill = 'rgba(148, 163, 184, 0.07)';
-    let gateGlow = 'transparent';
-
-    if (isPracticing && currentLive?.isVoiced) {
-      const targetNote = practiceMode === 'note' && selectedNote ? selectedNote : activeGateNote;
-      if (targetNote) {
-        const isCorrectNote = Math.abs(currentLive.midi - targetNote.midi) <= 0.65;
-        if (isCorrectNote) {
-          gateStroke = '#39ff14';
-          gateFill = 'rgba(57, 255, 20, 0.16)';
-          gateGlow = '#39ff14';
-        } else {
-          gateStroke = '#ef4444';
-          gateFill = 'rgba(239, 68, 68, 0.22)';
-          gateGlow = '#ef4444';
-        }
       } else {
-        gateStroke = '#ef4444';
-        gateFill = 'rgba(239, 68, 68, 0.16)';
-        gateGlow = '#ef4444';
+        ctx.fillStyle = isBlack ? '#1e293b' : '#334155';
+        ctx.shadowBlur = 0;
+      }
+
+      ctx.fillRect(0, y, PIANO_WIDTH - 2, keyHeight - 1);
+      ctx.shadowBlur = 0;
+
+      // Key Note Label
+      ctx.fillStyle = isKeyActive ? '#0f172a' : isBlack ? '#94a3b8' : '#e2e8f0';
+      ctx.font = 'bold 8.5px monospace';
+      const octave = Math.floor(m / 12);
+      const noteName = `${NOTE_NAMES[noteIdx]}${octave}`;
+      if (!isBlack || noteIdx === 1 || noteIdx === 6 || isKeyActive) {
+        ctx.fillText(noteName, 4, y + keyHeight - 4);
       }
     }
 
     ctx.save();
-    ctx.fillStyle = gateFill;
-    ctx.strokeStyle = gateStroke;
-    ctx.lineWidth = 2.5;
-    if (gateGlow !== 'transparent') {
-      ctx.shadowColor = gateGlow;
-      ctx.shadowBlur = 16;
-    }
     ctx.beginPath();
-    ctx.roundRect(gateX - gateWidth / 2, 24, gateWidth, axisY - 28, 6);
-    ctx.fill();
-    ctx.stroke();
-    ctx.restore();
+    ctx.rect(PIANO_WIDTH, 0, plotWidth, axisY);
+    ctx.clip();
 
-    if (isPracticing && currentLive?.isVoiced) {
+    // 2. Beat & Time Vertical Grid Lines
+    drawMetronomeBeatGrid(ctx, timeToX, PIANO_WIDTH, width, axisY);
+
+    // 3. Render Piano Roll Note Rectangles
+    if (!hideReferenceGraph) {
+      effectiveNotes.forEach((n, idx) => {
+        const x = timeToX(n.start);
+        const w = Math.max(8, n.duration * pixelsPerSecond);
+        if (x + w < PIANO_WIDTH - 20 || x > width + 20) return;
+
+        const y = midiToY(n.midi);
+        const isInsideGate = currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08;
+        const isSelectedInNoteMode = practiceMode === 'note' && idx === selectedNoteIndex;
+        const isThisNoteHit = isInsideGate && isTargetHit;
+
+        // Styling identical to Interactive Piano Roll
+        if (isThisNoteHit) {
+          ctx.fillStyle = '#39ff14'; // Neon Green Hit!
+          ctx.shadowColor = '#39ff14';
+          ctx.shadowBlur = 14;
+          ctx.strokeStyle = '#bbf7d0';
+          ctx.lineWidth = 2;
+        } else if (isInsideGate) {
+          ctx.fillStyle = '#38bdf8'; // Glowing Cyan Playhead
+          ctx.shadowColor = '#06b6d4';
+          ctx.shadowBlur = 12;
+          ctx.strokeStyle = '#e0f2fe';
+          ctx.lineWidth = 1.8;
+        } else if (isSelectedInNoteMode) {
+          ctx.fillStyle = '#f59e0b'; // Amber Selected
+          ctx.shadowColor = '#d97706';
+          ctx.shadowBlur = 10;
+          ctx.strokeStyle = '#fbbf24';
+          ctx.lineWidth = 2;
+        } else {
+          ctx.fillStyle = '#0284c7'; // Deep ocean cyan from PianoRoll
+          ctx.shadowBlur = 0;
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 1;
+        }
+
+        ctx.beginPath();
+        ctx.roundRect(x, y + 1, w, keyHeight - 2, 3.5);
+        ctx.fill();
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        // Inner note name text label
+        if (w > 18) {
+          ctx.fillStyle = isThisNoteHit || isInsideGate ? '#0f172a' : '#ffffff';
+          ctx.font = 'bold 9px sans-serif';
+          ctx.fillText(n.note_name, x + 4, y + keyHeight - 4);
+        }
+      });
+    }
+
+    // 4. Playhead Beam & Detection Gate
+    const beamColor = isTargetHit ? '#39ff14' : isLiveVoiced ? '#ef4444' : '#38bdf8';
+    ctx.strokeStyle = beamColor;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = beamColor;
+    ctx.shadowBlur = isTargetHit ? 14 : 8;
+    ctx.beginPath();
+    ctx.moveTo(gateX, 0);
+    ctx.lineTo(gateX, axisY);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Live User Pitch Indicator on Playhead Gate
+    if (isLiveVoiced) {
       const clampedMidi = Math.max(minMidi, Math.min(maxMidi, currentLive.midi));
-      const userGateY = midiToY(clampedMidi) + 9;
-      ctx.fillStyle = gateStroke;
+      const userY = midiToY(clampedMidi);
+      ctx.fillStyle = isTargetHit ? '#39ff14' : '#ef4444';
+      ctx.shadowColor = isTargetHit ? '#39ff14' : '#ef4444';
+      ctx.shadowBlur = 12;
+
       ctx.beginPath();
-      ctx.roundRect(gateX - gateWidth / 2 + 2, userGateY - 5, gateWidth - 4, 10, 3);
+      ctx.roundRect(gateX - 16, userY + 1, 32, keyHeight - 2, 4);
       ctx.fill();
+      ctx.shadowBlur = 0;
+
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 9px monospace';
+      ctx.fillText(currentLive.noteName, gateX - 11, userY + keyHeight - 4);
     }
 
     ctx.restore();
 
-    // 4. Bottom Scrolling Time Axis
+    // 5. Bottom Scrolling Time Axis
     ctx.fillStyle = '#0a101d';
     ctx.fillRect(0, axisY, width, 20);
     ctx.strokeStyle = '#1e293b';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(leftMargin, axisY);
+    ctx.moveTo(PIANO_WIDTH, axisY);
     ctx.lineTo(width, axisY);
     ctx.stroke();
 
-    const startSec = Math.max(0, Math.floor(currentTime - (gateX - leftMargin) / pixelsPerSecond));
+    const startSec = Math.max(0, Math.floor(currentTime - (gateX - PIANO_WIDTH) / pixelsPerSecond));
     const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - gateX) / pixelsPerSecond));
     ctx.fillStyle = '#64748b';
     ctx.font = '9px monospace';
     for (let t = startSec; t <= endSec; t += 1) {
       const tx = timeToX(t);
-      if (tx < leftMargin || tx > width) continue;
+      if (tx < PIANO_WIDTH || tx > width) continue;
       ctx.strokeStyle = '#334155';
       ctx.beginPath();
       ctx.moveTo(tx, axisY);
@@ -1100,7 +1147,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const badgeY = 4;
 
     ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-    ctx.strokeStyle = gateStroke;
+    ctx.strokeStyle = beamColor;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
@@ -1109,6 +1156,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
     ctx.fillStyle = '#ffffff';
     ctx.fillText(timeText, badgeX + 6, badgeY + 13);
+    } catch (err) {
+      console.error('Practice canvas render error:', err);
+    }
   };
 
   useEffect(() => {
@@ -1126,7 +1176,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     const currentTime = audioRef.current ? audioRef.current.currentTime : 0;
-    const leftMargin = 38;
+    const leftMargin = studioType === 'instrument' ? 54 : 38;
     const plotWidth = width - leftMargin;
     const anchorX = studioType === 'instrument' ? leftMargin + plotWidth * 0.25 : leftMargin + plotWidth * 0.45;
     const pixelsPerSecond = 145;
@@ -1136,13 +1186,15 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const minMidi = allMidis.length > 0 ? Math.max(36, Math.floor(Math.min(...allMidis)) - 2) : 48;
     const maxMidi = allMidis.length > 0 ? Math.min(84, Math.ceil(Math.max(...allMidis)) + 2) : 72;
     const midiRange = maxMidi - minMidi || 12;
+    const totalKeys = Math.max(12, midiRange + 1);
+    const keyHeight = Math.max(14, (height - 20) / totalKeys);
 
     for (let i = 0; i < effectiveNotes.length; i++) {
       const n = effectiveNotes[i];
       const nx = anchorX + (n.start - currentTime) * pixelsPerSecond;
-      const nw = Math.max(16, n.duration * pixelsPerSecond);
-      const ny = height - ((n.midi - minMidi) / midiRange) * (height - 48) - 34;
-      const nh = 18;
+      const nw = Math.max(8, n.duration * pixelsPerSecond);
+      const ny = studioType === 'instrument' ? (maxMidi - n.midi) * keyHeight : height - ((n.midi - minMidi) / midiRange) * (height - 48) - 34;
+      const nh = studioType === 'instrument' ? keyHeight : 18;
 
       if (clickX >= nx - 4 && clickX <= nx + nw + 4 && clickY >= ny - 4 && clickY <= ny + nh + 4) {
         setSelectedNoteIndex(i);
@@ -1184,7 +1236,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             </div>
             <div>
               <h2 className="text-base font-semibold text-white flex items-center gap-2">
-                Real-Time Vocal Practice Studio
+                {studioType === 'instrument' ? 'Real-Time Instrument Practice Studio' : 'Real-Time Vocal Practice Studio'}
                 {isPracticing && (
                   <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-700/60 text-emerald-400 font-mono animate-pulse">
                     LIVE TRACKING
@@ -1192,9 +1244,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 )}
               </h2>
               <p className="text-xs text-slate-400">
-                {practiceMode === 'note'
-                  ? 'Note-by-Note Mode: Focus and master one target note at a time.'
-                  : 'Full Song Mode: Sing along with the entire phrase while the studio measures your vocal pitch.'}
+                {studioType === 'instrument'
+                  ? (practiceMode === 'note'
+                      ? 'Note-by-Note Mode: Play along with target notes on the Interactive Piano Roll.'
+                      : 'Full Song Mode: Play your instrument along with the scrolling Piano Roll while tracking pitch and timing in real time.')
+                  : (practiceMode === 'note'
+                      ? 'Note-by-Note Mode: Focus and master one target note at a time.'
+                      : 'Full Song Mode: Sing along with the melody while the studio measures your vocal pitch.')}
               </p>
             </div>
           </div>
@@ -1291,31 +1347,38 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         {/* Practice Mode Switcher (Vocal vs Instrument + Full Song vs Note-by-Note + Blind Mode) */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
           <div className="flex flex-wrap items-center gap-2">
-            {/* Domain Mode: Vocal vs Instrument */}
-            <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
-              <button
-                onClick={() => setStudioType('vocal')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  studioType === 'vocal'
-                    ? 'bg-emerald-950/60 border border-emerald-500/60 text-emerald-300 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Mic2 className="w-3.5 h-3.5" />
-                <span>Vocal</span>
-              </button>
-              <button
-                onClick={() => setStudioType('instrument')}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  studioType === 'instrument'
-                    ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
+            {/* Domain Mode: Vocal vs Instrument (Locked to Instrument if user selected Basic Pitch) */}
+            {isInstrumentLocked ? (
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-950/80 border border-cyan-500/60 text-cyan-300 text-xs font-semibold shadow-sm" title="Instrument Practice Mode (Spotify Basic Pitch Neural)">
                 <Piano className="w-3.5 h-3.5" />
-                <span>Instrument</span>
-              </button>
-            </div>
+                <span>Instrument Practice</span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
+                <button
+                  onClick={() => setStudioType('vocal')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    studioType === 'vocal'
+                      ? 'bg-emerald-950/60 border border-emerald-500/60 text-emerald-300 shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Mic2 className="w-3.5 h-3.5" />
+                  <span>Vocal</span>
+                </button>
+                <button
+                  onClick={() => setStudioType('instrument')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    studioType === 'instrument'
+                      ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Piano className="w-3.5 h-3.5" />
+                  <span>Instrument</span>
+                </button>
+              </div>
+            )}
 
             {/* Phrase Scope: Full Song vs Note-by-Note */}
             <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">

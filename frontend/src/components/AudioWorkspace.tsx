@@ -19,6 +19,8 @@ import {
   ZoomIn,
   ZoomOut,
   Save,
+  Piano,
+  Mic2,
 } from 'lucide-react';
 import type { AudioInfo, PreprocessOptions } from '../types';
 import {
@@ -81,6 +83,23 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
   // A/B Audio comparison
   const [activeVersion, setActiveVersion] = useState<'original' | 'processed'>('original');
   const [processedAudio, setProcessedAudio] = useState<AudioInfo | null>(null);
+
+  // Audio source domain (Instrument vs Vocal)
+  const [sourceType, setSourceType] = useState<'instrument' | 'vocal'>(() => {
+    try {
+      const saved = localStorage.getItem('practune_source_type');
+      return saved === 'instrument' || saved === 'vocal' ? saved : 'instrument';
+    } catch {
+      return 'instrument';
+    }
+  });
+
+  const handleSourceTypeChange = (type: 'instrument' | 'vocal') => {
+    setSourceType(type);
+    try {
+      localStorage.setItem('practune_source_type', type);
+    } catch {}
+  };
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -492,7 +511,11 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
     if (!activeAudio) return;
     setIsTranscribing(true);
     try {
-      const trans = await transcribeAudio(activeAudio.id);
+      const preferredEngine = sourceType === 'instrument'
+        ? (localStorage.getItem('practune_instrument_engine') as 'basic_pitch' | 'yin' | null) || 'basic_pitch'
+        : (localStorage.getItem('practune_vocal_engine') as 'basic_pitch' | 'yin' | null) || 'yin';
+
+      const trans = await transcribeAudio(activeAudio.id, sourceType, preferredEngine);
       onTranscriptionComplete(trans);
     } catch (err: any) {
       alert(`Transcription error: ${err.message}`);
@@ -791,6 +814,36 @@ export const AudioWorkspace: React.FC<AudioWorkspaceProps> = ({
             >
               <RefreshCw className={`w-3 h-3 ${isLooping ? 'animate-spin' : ''}`} />
               Loop
+            </button>
+          </div>
+
+          {/* Audio Source Domain (Instrument vs Vocal) */}
+          <div className="flex items-center gap-1 p-1 bg-slate-950/80 border border-slate-800 rounded-xl">
+            <button
+              type="button"
+              onClick={() => handleSourceTypeChange('instrument')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                sourceType === 'instrument'
+                  ? 'bg-cyan-950/80 border border-cyan-500/60 text-cyan-300 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Instrument mode: Polyphonic chords & discrete notes with Spotify Basic Pitch"
+            >
+              <Piano className="w-3.5 h-3.5" />
+              <span>Instrument</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleSourceTypeChange('vocal')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                sourceType === 'vocal'
+                  ? 'bg-emerald-950/80 border border-emerald-500/60 text-emerald-300 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Vocal mode: Smooth organic contour & vibrato tracking with DSP YIN"
+            >
+              <Mic2 className="w-3.5 h-3.5" />
+              <span>Vocal</span>
             </button>
           </div>
 

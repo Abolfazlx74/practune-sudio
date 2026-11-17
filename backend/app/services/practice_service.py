@@ -407,8 +407,16 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
         prev_end = ref_notes[i - 1].end if i > 0 else 0.0
         next_start = ref_notes[i + 1].start if i < num_notes - 1 else float("inf")
 
-        win_start = max(note.start - 0.05, (prev_end + note.start) / 2.0 if prev_end < note.start else prev_end)
-        win_end = min(note.end + 0.05, (note.end + next_start) / 2.0 if next_start > note.end else next_start)
+        # Strict windowing without adjacent bleeding, protecting overlapping notes/polyphony
+        if prev_end < note.start:
+            win_start = max(note.start - 0.05, (prev_end + note.start) / 2.0)
+        else:
+            win_start = note.start - 0.02
+
+        if next_start > note.end:
+            win_end = min(note.end + 0.05, (note.end + next_start) / 2.0)
+        else:
+            win_end = note.end + 0.02
 
         mask = (aligned_times >= win_start) & (aligned_times <= win_end)
 
@@ -687,7 +695,13 @@ def evaluate_imported_performance(
 
     try:
         y, sr, _ = load_audio(tmp_path, target_sr=22050)
-        perf_notes, perf_pitches, perf_transitions, _, _, _ = run_yin_transcription(y, sr)
+        ref_engine = getattr(ref, "transcription_engine", "") or ""
+        use_basic_pitch = ("Basic Pitch" in ref_engine) or (studio_type == "instrument")
+        if use_basic_pitch:
+            from .pitch_transcription import run_basic_pitch_transcription
+            perf_notes, perf_pitches, perf_transitions, _, _, _ = run_basic_pitch_transcription(Path(tmp_path), y, sr)
+        else:
+            perf_notes, perf_pitches, perf_transitions, _, _, _ = run_yin_transcription(y, sr)
     finally:
         try:
             os.remove(tmp_path)

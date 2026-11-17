@@ -18,7 +18,7 @@ from .dsp_utils import (
     midi_to_hz,
 )
 
-PIPELINE_VERSION = "2.4.0"
+PIPELINE_VERSION = "2.7.0"
 TRANSCRIPTION_DIR = STORAGE_DIR / "transcriptions"
 TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -32,6 +32,160 @@ def midi_to_note_info(midi_num: float) -> Tuple[str, int, float]:
     note_name = f"{NOTE_NAMES[note_idx]}{octave}"
     cents_dev = (midi_num - rounded_midi) * 100.0
     return note_name, octave, round(cents_dev, 1)
+
+def run_basic_pitch_transcription(
+    audio_path: Path,
+    y: np.ndarray,
+    sr: int
+) -> Tuple[List[NoteItem], List[PitchFrame], List[TransitionRegion], List[VibratoInfo], bool, Optional[str]]:
+    """
+    Neural polyphonic transcription using Spotify Basic Pitch (Harmonic-CNN model).
+    Specialized for instruments (polyphonic chords, attack transients, guitar/piano notes).
+    """
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    try:
+        from basic_pitch.inference import predict
+        # onset_threshold=0.5, frame_threshold=0.3, minimum_note_length=60ms
+        model_output, midi_data, note_events = predict(
+            str(audio_path),
+            onset_threshold=0.5,
+            frame_threshold=0.3,
+            minimum_note_length=60.0,
+        )
+    except Exception as exc:
+        print(f"[Basic Pitch Warning] Inference failed: {exc}. Falling back to YIN.")
+        notes, pf, tr, vib, is_mono, warn = run_yin_transcription(y, sr)
+        return notes, pf, tr, vib, is_mono, f"Fallback to YIN engine: {exc}"
+
+    if not note_events:
+        # If no notes detected by neural model, fall back gracefully to DSP YIN
+        return run_yin_transcription(y, sr)
+
+    sorted_events = sorted(note_events, key=lambda ev: (ev[0], ev[2]))
+    raw_notes: List[NoteItem] = []
+    event_bends: Dict[int, List[float]] = {}
+
+    for idx, ev in enumerate(sorted_events):
+        start = round(float(ev[0]), 3)
+        end = round(float(ev[1]), 3)
+        midi_val = int(round(ev[2]))
+        amp = float(ev[3])
+        bends = ev[4] or []
+
+        dur = round(end - start, 3)
+        if dur < 0.04:
+            continue
+
+        note_name, octave, cents_dev = midi_to_note_info(midi_val)
+        freq = round(midi_to_hz(midi_val), 2)
+        confidence = round(min(1.0, max(0.40, amp)), 2)
+        note_id = f"note_{idx+1}_{round(start, 2)}"
+
+        raw_notes.append(NoteItem(
+            id=note_id,
+            midi=midi_val,
+            note_name=note_name,
+            octave=octave,
+            start=start,
+            end=end,
+            duration=dur,
+            confidence=confidence,
+            frequency=freq,
+            cents_deviation=cents_dev
+        ))
+        event_bends[idx] = [float(b) / 3.0 for b in bends]
+
+    # 1. Harmonic Ghost Pruning (filter physical octave overtones with lower confidence)
+    pruned_notes: List[NoteItem] = []
+    for i, n in enumerate(raw_notes):
+        is_ghost = False
+        for j, other in enumerate(raw_notes):
+            if i == j:
+                continue
+            overlap = min(n.end, other.end) - max(n.start, other.start)
+            min_dur = min(n.duration, other.duration)
+            if overlap >= min_dur * 0.70:
+                diff = n.midi - other.midi
+                if diff in [12, 24] and (n.confidence <= other.confidence * 1.05):
+                    is_ghost = True
+                    break
+        if not is_ghost:
+            pruned_notes.append(n)
+
+    # 2. Merge adjacent micro-fragments of identical pitch (recombining vibrato splits)
+    merged_notes: List[NoteItem] = []
+    for n in pruned_notes:
+        if not merged_notes:
+            merged_notes.append(n.model_copy())
+            continue
+        last = merged_notes[-1]
+        gap = n.start - last.end
+        if last.midi == n.midi and gap < 0.08:
+            last.end = n.end
+            last.duration = round(last.end - last.start, 3)
+            last.confidence = max(last.confidence, n.confidence)
+        else:
+            merged_notes.append(n.model_copy())
+
+    notes = merged_notes
+
+    # 3. Build high-resolution pitch contour frames across each note's duration
+    pitch_frames_list: List[PitchFrame] = []
+    for n in notes:
+        cur_t = n.start
+        n_steps = max(1, int(round(n.duration / 0.025)))
+        for k in range(n_steps):
+            frame_time = round(n.start + k * 0.025, 3)
+            pitch_frames_list.append(PitchFrame(
+                time=frame_time,
+                frequency=n.frequency,
+                midi=float(n.midi),
+                confidence=n.confidence
+            ))
+
+    pitch_frames = sorted(pitch_frames_list, key=lambda f: f.time)
+
+    # Detect polyphony (overlapping notes)
+    is_monophonic = True
+    for i in range(len(notes)):
+        for j in range(i + 1, min(i + 10, len(notes))):
+            overlap = min(notes[i].end, notes[j].end) - max(notes[i].start, notes[j].start)
+            if overlap > 0.06:
+                is_monophonic = False
+                break
+        if not is_monophonic:
+            break
+
+    suitability_warning = None
+    if not is_monophonic:
+        suitability_warning = "Polyphonic instrumental content detected (simultaneous notes or chords)."
+
+    # Extract transitions between consecutive notes (gap < 80ms)
+    transitions: List[TransitionRegion] = []
+    for i in range(len(notes) - 1):
+        n1 = notes[i]
+        n2 = notes[i + 1]
+        gap = n2.start - n1.end
+        if 0.0 <= gap <= 0.08 and abs(n2.midi - n1.midi) >= 1:
+            transitions.append(TransitionRegion(
+                start=n1.end,
+                end=n2.start,
+                from_note=n1.note_name,
+                to_note=n2.note_name,
+                from_midi=float(n1.midi),
+                to_midi=float(n2.midi),
+                transition_type="slide"
+            ))
+
+    # Vibrato analysis on note frames
+    vibratos: List[VibratoInfo] = []
+    for n in notes:
+        n_frames = [f for f in pitch_frames if n.start <= f.time <= n.end]
+        v_info = analyze_vibrato(n_frames, n.id, n.midi)
+        if v_info.has_vibrato:
+            vibratos.append(v_info)
+
+    return notes, pitch_frames, transitions, vibratos, is_monophonic, suitability_warning
 
 def analyze_vibrato(seg_frames: List[PitchFrame], note_id: str, note_midi: int) -> VibratoInfo:
     if len(seg_frames) < 8:
@@ -233,7 +387,11 @@ def run_yin_transcription(y: np.ndarray, sr: int) -> Tuple[List[NoteItem], List[
 
     return notes, pitch_frames, transitions, vibratos, is_monophonic, suitability_warning
 
-def transcribe_audio(audio_id: str) -> TranscriptionResult:
+def transcribe_audio(
+    audio_id: str,
+    source_type: str = "instrument",
+    engine: Optional[str] = None
+) -> TranscriptionResult:
     audio_path = get_audio_filepath(audio_id)
     if not audio_path or not audio_path.exists():
         raise FileNotFoundError(f"Audio file for id '{audio_id}' not found.")
@@ -243,9 +401,16 @@ def transcribe_audio(audio_id: str) -> TranscriptionResult:
     bpm = estimate_bpm_tempo(y, sr)
     key_est, scale_est = estimate_key_chroma(y, sr)
 
-    # Use High-Precision DSP YIN & Onset Segmentation for mathematical pitch fidelity
-    notes, pitch_frames, transitions, vibratos, is_mono, suit_warn = run_yin_transcription(y, sr)
-    engine_name = "DSP YIN & Onset Tracker"
+    # Determine engine based on user preference or source_type default:
+    # Instrument defaults to Spotify Basic Pitch (Neural); Vocal defaults to DSP YIN
+    chosen_engine = engine.lower() if engine else ("basic_pitch" if source_type == "instrument" else "yin")
+
+    if chosen_engine in ["basic_pitch", "basicpitch", "spotify"]:
+        notes, pitch_frames, transitions, vibratos, is_mono, suit_warn = run_basic_pitch_transcription(audio_path, y, sr)
+        engine_name = "Spotify Basic Pitch & YIN Hybrid"
+    else:
+        notes, pitch_frames, transitions, vibratos, is_mono, suit_warn = run_yin_transcription(y, sr)
+        engine_name = "DSP YIN & Onset Tracker"
 
     conf_overall = round(float(np.mean([n.confidence for n in notes])), 2) if notes else 0.0
 
@@ -272,7 +437,11 @@ def transcribe_audio(audio_id: str) -> TranscriptionResult:
 
     return result
 
-def get_transcription(audio_id: str) -> Optional[TranscriptionResult]:
+def get_transcription(
+    audio_id: str,
+    source_type: str = "instrument",
+    engine: Optional[str] = None
+) -> Optional[TranscriptionResult]:
     out_file = TRANSCRIPTION_DIR / f"{audio_id}.json"
     if not out_file.exists():
         return None
@@ -281,7 +450,7 @@ def get_transcription(audio_id: str) -> Optional[TranscriptionResult]:
             data = json.load(f)
             # Automatically refresh stale transcriptions generated by older pipeline versions
             if data.get("pipeline_version") != PIPELINE_VERSION:
-                return transcribe_audio(audio_id)
+                return transcribe_audio(audio_id, source_type=source_type, engine=engine)
             return TranscriptionResult(**data)
     except Exception:
-        return transcribe_audio(audio_id)
+        return transcribe_audio(audio_id, source_type=source_type, engine=engine)
