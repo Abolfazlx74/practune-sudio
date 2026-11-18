@@ -104,10 +104,22 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [countdownValue, setCountdownValue] = useState<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
 
-  // Practice Mode (Full Song vs Note-by-Note)
+  // Practice Mode (Full Song vs Section / Range Mode)
   const [practiceMode, setPracticeMode] = useState<'full' | 'note'>('full');
-  const [selectedNoteIndex, setSelectedNoteIndex] = useState<number>(0);
-  const [loopNote, setLoopNote] = useState<boolean>(true);
+  const [rangeStartIndex, setRangeStartIndex] = useState<number>(0);
+  const [rangeEndIndex, setRangeEndIndex] = useState<number>(0);
+  const [loopSection, setLoopSection] = useState<boolean>(true);
+
+  // Backward compatibility alias for single-note references
+  const actualStartIdx = Math.min(rangeStartIndex, rangeEndIndex);
+  const actualEndIdx = Math.max(rangeStartIndex, rangeEndIndex);
+  const selectedNoteIndex = actualStartIdx;
+  const loopNote = loopSection;
+  const setLoopNote = setLoopSection;
+  const setSelectedNoteIndex = (idx: number) => {
+    setRangeStartIndex(idx);
+    setRangeEndIndex(idx);
+  };
 
   // Digital timeline clock
   const [currentTimeDisplay, setCurrentTimeDisplay] = useState<number>(0);
@@ -322,7 +334,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   };
 
   const duration = transcription.duration || 10;
-  const selectedNote: NoteItem | undefined = effectiveNotes[selectedNoteIndex];
+  const rangeStartNote: NoteItem | undefined = effectiveNotes[actualStartIdx];
+  const rangeEndNote: NoteItem | undefined = effectiveNotes[actualEndIdx] || rangeStartNote;
+  const selectedSectionNotes: NoteItem[] = effectiveNotes.slice(actualStartIdx, actualEndIdx + 1);
+  const selectedNote: NoteItem | undefined = rangeStartNote;
 
   // Stop mic and countdown on unmount
   useEffect(() => {
@@ -443,8 +458,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setIsPracticing(true);
 
       if (audioRef.current) {
-        if (practiceMode === 'note' && selectedNote) {
-          audioRef.current.currentTime = Math.max(0, selectedNote.start - 0.15);
+        if (practiceMode === 'note' && rangeStartNote) {
+          audioRef.current.currentTime = Math.max(0, rangeStartNote.start - 0.15);
         } else {
           audioRef.current.currentTime = 0;
         }
@@ -483,8 +498,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setIsEvaluating(true);
       try {
         const evalTargetNotes =
-          practiceMode === 'note' && selectedNote
-            ? [selectedNote]
+          practiceMode === 'note'
+            ? (selectedSectionNotes.length > 0 ? selectedSectionNotes : effectiveNotes)
             : effectiveNotes;
         const tolerance = studioType === 'instrument' ? 70.0 : 65.0;
         const resp = await evaluatePractice(
@@ -498,7 +513,11 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
         const currentSettings: PracticeConfigSettings = {
           mode: practiceMode,
-          target_note_name: practiceMode === 'note' && selectedNote ? selectedNote.note_name : undefined,
+          target_note_name: practiceMode === 'note' && rangeStartNote
+            ? (actualStartIdx === actualEndIdx
+              ? rangeStartNote.note_name
+              : `${rangeStartNote.note_name} → ${rangeEndNote?.note_name || rangeStartNote.note_name} (${selectedSectionNotes.length} notes)`)
+            : undefined,
           target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
           playback_speed: playbackSpeed,
           transpose_semitones: transposeSemitones,
@@ -629,10 +648,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       metronomeGrid.timeSignature === '3/4'
         ? 3
         : metronomeGrid.timeSignature === '6/8'
-        ? 6
-        : metronomeGrid.timeSignature === '2/4'
-        ? 2
-        : 4;
+          ? 6
+          : metronomeGrid.timeSignature === '2/4'
+            ? 2
+            : 4;
 
     let beatIdx = 0;
     for (let t = metronomeGrid.anchorTime; t <= duration; t += beatDur) {
@@ -657,206 +676,486 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   const drawPracticeCanvas = () => {
     try {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
 
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    ctx.scale(dpr, dpr);
+      const dpr = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      ctx.scale(dpr, dpr);
 
-    ctx.clearRect(0, 0, width, height);
+      ctx.clearRect(0, 0, width, height);
 
-    // Dark sleek DAW background
-    ctx.fillStyle = '#070b12';
-    ctx.fillRect(0, 0, width, height);
+      // Dark sleek DAW background
+      ctx.fillStyle = '#070b12';
+      ctx.fillRect(0, 0, width, height);
 
-    const currentTime = audioRef.current ? audioRef.current.currentTime : 0;
+      const currentTime = audioRef.current ? audioRef.current.currentTime : 0;
 
-    // Handle note-by-note looping during active practice
-    if (isPracticing && practiceMode === 'note' && selectedNote && loopNote && audioRef.current) {
-      const loopEnd = selectedNote.end + 0.2;
-      const loopStart = Math.max(0, selectedNote.start - 0.15);
-      if (currentTime >= loopEnd) {
-        audioRef.current.currentTime = loopStart;
+      // Handle section / note looping during active practice
+      if (isPracticing && practiceMode === 'note' && rangeStartNote && rangeEndNote && loopSection && audioRef.current) {
+        const loopEnd = rangeEndNote.end + 0.2;
+        const loopStart = Math.max(0, rangeStartNote.start - 0.15);
+        if (currentTime >= loopEnd) {
+          audioRef.current.currentTime = loopStart;
+        }
       }
-    }
 
-    // Smoothly update digital clock display
-    const nowPerf = performance.now();
-    if (nowPerf - lastDisplayUpdateRef.current > 40) {
-      lastDisplayUpdateRef.current = nowPerf;
-      setCurrentTimeDisplay(currentTime);
-    }
+      // Smoothly update digital clock display
+      const nowPerf = performance.now();
+      if (nowPerf - lastDisplayUpdateRef.current > 40) {
+        lastDisplayUpdateRef.current = nowPerf;
+        setCurrentTimeDisplay(currentTime);
+      }
 
-    // Pitch Range derived from clean contour or notes
-    const validContourMidis = rawContour.filter((p) => p.midi > 0).map((p) => p.midi);
-    const allMidis = validContourMidis.length > 0 ? validContourMidis : effectiveNotes.map((n) => n.midi);
-    const minMidi = allMidis.length > 0 ? Math.max(36, Math.floor(Math.min(...allMidis)) - 2) : 48;
-    const maxMidi = allMidis.length > 0 ? Math.min(84, Math.ceil(Math.max(...allMidis)) + 2) : 72;
-    const midiRange = maxMidi - minMidi || 12;
+      // Pitch Range derived from clean contour or notes
+      const validContourMidis = rawContour.filter((p) => p.midi > 0).map((p) => p.midi);
+      const allMidis = validContourMidis.length > 0 ? validContourMidis : effectiveNotes.map((n) => n.midi);
+      const minMidi = allMidis.length > 0 ? Math.max(36, Math.floor(Math.min(...allMidis)) - 2) : 48;
+      const maxMidi = allMidis.length > 0 ? Math.min(84, Math.ceil(Math.max(...allMidis)) + 2) : 72;
+      const midiRange = maxMidi - minMidi || 12;
 
-    const axisY = height - 20;
-    const hideReferenceGraph = blindMode && isPracticing;
+      const axisY = height - 20;
+      const hideReferenceGraph = blindMode && isPracticing;
 
-    // =========================================================================
-    // VOCAL MODE: Reference-Video Style Smooth Contour + Concentric Ring
-    // =========================================================================
-    if (studioType === 'vocal') {
-      const leftMargin = 38;
-      const plotWidth = width - leftMargin;
-      const centerX = leftMargin + plotWidth * 0.45;
-      const pixelsPerSecond = 145;
+      // =========================================================================
+      // VOCAL MODE: Reference-Video Style Smooth Contour + Concentric Ring
+      // =========================================================================
+      if (studioType === 'vocal') {
+        const leftMargin = 38;
+        const plotWidth = width - leftMargin;
+        const centerX = leftMargin + plotWidth * 0.45;
+        const pixelsPerSecond = 145;
 
-      const timeToX = (t: number) => centerX + (t - currentTime) * pixelsPerSecond;
-      const midiToY = (m: number) => height - ((m - minMidi) / midiRange) * (height - 48) - 28;
+        const timeToX = (t: number) => centerX + (t - currentTime) * pixelsPerSecond;
+        const midiToY = (m: number) => height - ((m - minMidi) / midiRange) * (height - 48) - 28;
 
-      // 1. Subtle Horizontal Staff Lines & Left Note Axis
-      for (let m = minMidi; m <= maxMidi; m++) {
-        const y = midiToY(m);
-        ctx.strokeStyle = m % 12 === 0 ? 'rgba(51, 65, 85, 0.35)' : 'rgba(30, 41, 59, 0.18)';
+        // 1. Subtle Horizontal Staff Lines & Left Note Axis
+        for (let m = minMidi; m <= maxMidi; m++) {
+          const y = midiToY(m);
+          ctx.strokeStyle = m % 12 === 0 ? 'rgba(51, 65, 85, 0.35)' : 'rgba(30, 41, 59, 0.18)';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(leftMargin, y);
+          ctx.lineTo(width, y);
+          ctx.stroke();
+
+          const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+          const octave = Math.floor(m / 12);
+          ctx.fillStyle = m % 12 === 0 ? '#94a3b8' : '#475569';
+          ctx.font = '9px monospace';
+          ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
+        }
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(leftMargin, 0, plotWidth, axisY);
+        ctx.clip();
+
+        // Optional Metronome Beat Grid Lines
+        drawMetronomeBeatGrid(ctx, timeToX, leftMargin, width, axisY);
+
+        const history = userPitchHistory.current;
+
+        // 2. Smooth Reference Vocal Contour (Ice-Blue ahead of cursor; Glowing Neon Green behind when matched)
+        if (!hideReferenceGraph && rawContour.length > 1) {
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+
+          for (let i = 1; i < rawContour.length; i++) {
+            const p1 = rawContour[i - 1];
+            const p2 = rawContour[i];
+            if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.22) continue;
+
+            const x1 = timeToX(p1.time);
+            const x2 = timeToX(p2.time);
+            if (x2 < leftMargin - 20 || x1 > width + 20) continue;
+
+            const y1 = midiToY(p1.midi);
+            const y2 = midiToY(p2.midi);
+
+            const isPassed = p2.time <= currentTime;
+            const isMatched = isPassed && isReferencePointMatchedByUser(p2.time, p2.midi, currentTime, history);
+
+            if (isMatched) {
+              ctx.strokeStyle = '#39ff14';
+              ctx.lineWidth = 4.5;
+              ctx.shadowColor = '#39ff14';
+              ctx.shadowBlur = 14;
+            } else if (isPassed) {
+              // Passed but not matched: dim slate-blue
+              ctx.strokeStyle = 'rgba(100, 116, 139, 0.30)';
+              ctx.lineWidth = 3;
+              ctx.shadowBlur = 0;
+            } else {
+              // Upcoming path ahead of cursor: clean silver-blue guide like reference video
+              ctx.strokeStyle = 'rgba(125, 211, 252, 0.36)';
+              ctx.lineWidth = 3.5;
+              ctx.shadowBlur = 0;
+            }
+
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+          ctx.shadowBlur = 0;
+
+          // Subtle note labels along sustained plateaus
+          effectiveNotes.forEach((n) => {
+            if (n.duration < 0.28) return;
+            const nx = timeToX(n.start);
+            if (nx < leftMargin || nx > width) return;
+            const refY = getTargetMidiAtTime(n.start + 0.05) ?? n.midi;
+            const ny = midiToY(refY);
+            ctx.fillStyle = 'rgba(186, 230, 253, 0.65)';
+            ctx.font = 'bold 9px monospace';
+            ctx.fillText(n.note_name, nx + 2, ny - 10);
+          });
+        } else if (hideReferenceGraph) {
+          ctx.fillStyle = 'rgba(148, 163, 184, 0.22)';
+          ctx.font = 'bold 12px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('BLIND MEMORY MODE — Sing from memory', leftMargin + plotWidth / 2, height / 2);
+          ctx.textAlign = 'left';
+        }
+
+        // 3. Off-Pitch User Trace (Smooth Coral-Red trace behind cursor where user deviated from melody)
+        if (history.length > 1) {
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
+
+          for (let i = 1; i < history.length; i++) {
+            const p1 = history[i - 1];
+            const p2 = history[i];
+            if (p2.time - p1.time > 0.20 || p2.time > currentTime) continue;
+
+            const x1 = timeToX(p1.time);
+            const x2 = timeToX(p2.time);
+            if (x2 < leftMargin - 20 || x1 > width + 20) continue;
+
+            const isMatched = isUserPitchMatchedWithWindow(p2.time, p2.midi);
+            if (isMatched && !hideReferenceGraph) continue;
+
+            const y1 = midiToY(p1.midi);
+            const y2 = midiToY(p2.midi);
+
+            ctx.strokeStyle = hideReferenceGraph ? '#38bdf8' : '#ef4444';
+            ctx.lineWidth = 3.2;
+            ctx.shadowColor = hideReferenceGraph ? '#38bdf8' : '#ef4444';
+            ctx.shadowBlur = 8;
+
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+          ctx.shadowBlur = 0;
+        }
+
+        ctx.restore();
+
+        // 4. Scrolling Bottom Time Axis
+        ctx.fillStyle = '#0a101d';
+        ctx.fillRect(0, axisY, width, 20);
+        ctx.strokeStyle = '#1e293b';
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(leftMargin, y);
-        ctx.lineTo(width, y);
+        ctx.moveTo(leftMargin, axisY);
+        ctx.lineTo(width, axisY);
         ctx.stroke();
 
-        const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-        const octave = Math.floor(m / 12);
-        ctx.fillStyle = m % 12 === 0 ? '#94a3b8' : '#475569';
+        const startSec = Math.max(0, Math.floor(currentTime - (centerX - leftMargin) / pixelsPerSecond));
+        const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - centerX) / pixelsPerSecond));
+        ctx.fillStyle = '#64748b';
         ctx.font = '9px monospace';
-        ctx.fillText(`${NOTE_NAMES[m % 12]}${octave}`, 6, y + 3);
+        for (let t = startSec; t <= endSec; t += 1) {
+          const tx = timeToX(t);
+          if (tx < leftMargin || tx > width) continue;
+          ctx.strokeStyle = '#334155';
+          ctx.beginPath();
+          ctx.moveTo(tx, axisY);
+          ctx.lineTo(tx, axisY + 4);
+          ctx.stroke();
+          ctx.fillText(`${t}s`, tx - 6, height - 6);
+        }
+
+        // 5. Fixed Center Playhead Beam & Concentric Live Pitch Ring Pointer
+        const beamGrad = ctx.createLinearGradient(centerX - 10, 0, centerX + 10, 0);
+        beamGrad.addColorStop(0, 'rgba(56, 189, 248, 0.0)');
+        beamGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.08)');
+        beamGrad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
+        ctx.fillStyle = beamGrad;
+        ctx.fillRect(centerX - 10, 0, 20, axisY);
+
+        ctx.strokeStyle = 'rgba(248, 250, 252, 0.30)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(centerX, 0);
+        ctx.lineTo(centerX, axisY);
+        ctx.stroke();
+
+        const currentLive = livePitchRef.current;
+        const targetMidiNow = getTargetMidiAtTime(currentTime);
+        let pointerMidi: number | null = null;
+        let isPointerInTune = true;
+
+        if (isPracticing && currentLive?.isVoiced) {
+          pointerMidi = currentLive.midi;
+          isPointerInTune = isUserPitchMatchedWithWindow(Math.max(0, currentTime - 0.15), currentLive.midi);
+        } else if (targetMidiNow !== null && !hideReferenceGraph) {
+          pointerMidi = targetMidiNow;
+          isPointerInTune = true;
+        }
+
+        if (pointerMidi !== null) {
+          const clampedMidi = Math.max(minMidi, Math.min(maxMidi, pointerMidi));
+          const ballY = midiToY(clampedMidi);
+          const ballColor =
+            isPracticing && currentLive?.isVoiced
+              ? (hideReferenceGraph ? '#38bdf8' : isPointerInTune ? '#39ff14' : '#ef4444')
+              : '#38bdf8';
+
+          ctx.save();
+          // Outer concentric halo ring
+          ctx.strokeStyle = ballColor;
+          ctx.globalAlpha = 0.45;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(centerX, ballY, 11, 0, Math.PI * 2);
+          ctx.stroke();
+
+          // Inner glowing core
+          ctx.globalAlpha = 1.0;
+          ctx.fillStyle = ballColor;
+          ctx.shadowColor = ballColor;
+          ctx.shadowBlur = 14;
+          ctx.beginPath();
+          ctx.arc(centerX, ballY, 5.5, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.8;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Floating Current Second Badge on Fixed Center Playhead
+        const timeText = `${currentTime.toFixed(2)}s`;
+        ctx.font = 'bold 10px monospace';
+        const textMetrics = ctx.measureText(timeText);
+        const badgeW = textMetrics.width + 12;
+        const badgeH = 18;
+        const badgeX = centerX - badgeW / 2;
+        const badgeY = 6;
+
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(timeText, badgeX + 6, badgeY + 13);
+        return;
+      }
+
+      // =========================================================================
+      // INSTRUMENT MODE: Interactive Piano Roll View (Synced to Analysis Style)
+      // =========================================================================
+      const PIANO_WIDTH = 54;
+      const plotWidth = width - PIANO_WIDTH;
+      const gateX = PIANO_WIDTH + plotWidth * 0.25;
+      const pixelsPerSecond = 145;
+
+      const totalKeys = Math.max(12, midiRange + 1);
+      const keyHeight = Math.max(14, axisY / totalKeys);
+      const midiToY = (m: number) => (maxMidi - m) * keyHeight;
+      const timeToX = (t: number) => gateX + (t - currentTime) * pixelsPerSecond;
+
+      // Detect live pitch & target match
+      const currentLive = livePitchRef.current;
+      let activeGateNote: NoteItem | null = null;
+      effectiveNotes.forEach((n) => {
+        if (currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08) {
+          activeGateNote = n;
+        }
+      });
+
+      const isLiveVoiced = isPracticing && !!currentLive?.isVoiced;
+      const isTargetHit = isLiveVoiced && !!activeGateNote && Math.abs(currentLive.midi - activeGateNote.midi) <= 0.70;
+
+      // 1. Draw Grid Rows & Left Piano Keyboard
+      for (let m = maxMidi; m >= minMidi; m--) {
+        const y = midiToY(m);
+        if (y + keyHeight < 0 || y > axisY) continue;
+
+        const noteIdx = ((m % 12) + 12) % 12;
+        const isBlack = [1, 3, 6, 8, 10].includes(noteIdx);
+        const isKeyActive = isLiveVoiced && Math.round(currentLive.midi) === m;
+        const isKeyTarget = activeGateNote && activeGateNote.midi === m;
+
+        // Row background in DAW grid
+        ctx.fillStyle = isBlack ? '#0c1222' : '#0f172a';
+        ctx.fillRect(PIANO_WIDTH, y, width - PIANO_WIDTH, keyHeight);
+
+        // Horizontal grid line
+        ctx.strokeStyle = '#1e293b';
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(PIANO_WIDTH, y + keyHeight);
+        ctx.lineTo(width, y + keyHeight);
+        ctx.stroke();
+
+        // Left Piano Key
+        if (isKeyActive) {
+          ctx.fillStyle = isTargetHit ? '#39ff14' : '#ef4444';
+          ctx.shadowColor = isTargetHit ? '#39ff14' : '#ef4444';
+          ctx.shadowBlur = 10;
+        } else if (isKeyTarget) {
+          ctx.fillStyle = '#0284c7';
+          ctx.shadowBlur = 0;
+        } else {
+          ctx.fillStyle = isBlack ? '#1e293b' : '#334155';
+          ctx.shadowBlur = 0;
+        }
+
+        ctx.fillRect(0, y, PIANO_WIDTH - 2, keyHeight - 1);
+        ctx.shadowBlur = 0;
+
+        // Key Note Label
+        ctx.fillStyle = isKeyActive ? '#0f172a' : isBlack ? '#94a3b8' : '#e2e8f0';
+        ctx.font = 'bold 8.5px monospace';
+        const octave = Math.floor(m / 12);
+        const noteName = `${NOTE_NAMES[noteIdx]}${octave}`;
+        if (!isBlack || noteIdx === 1 || noteIdx === 6 || isKeyActive) {
+          ctx.fillText(noteName, 4, y + keyHeight - 4);
+        }
       }
 
       ctx.save();
       ctx.beginPath();
-      ctx.rect(leftMargin, 0, plotWidth, axisY);
+      ctx.rect(PIANO_WIDTH, 0, plotWidth, axisY);
       ctx.clip();
 
-      // Optional Metronome Beat Grid Lines
-      drawMetronomeBeatGrid(ctx, timeToX, leftMargin, width, axisY);
+      // 2. Beat & Time Vertical Grid Lines
+      drawMetronomeBeatGrid(ctx, timeToX, PIANO_WIDTH, width, axisY);
 
-      const history = userPitchHistory.current;
+      // 3. Render Piano Roll Note Rectangles
+      if (!hideReferenceGraph) {
+        effectiveNotes.forEach((n, idx) => {
+          const x = timeToX(n.start);
+          const w = Math.max(8, n.duration * pixelsPerSecond);
+          if (x + w < PIANO_WIDTH - 20 || x > width + 20) return;
 
-      // 2. Smooth Reference Vocal Contour (Ice-Blue ahead of cursor; Glowing Neon Green behind when matched)
-      if (!hideReferenceGraph && rawContour.length > 1) {
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
+          const y = midiToY(n.midi);
+          const isInsideGate = currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08;
+          const isRangeBoundary = practiceMode === 'note' && (idx === actualStartIdx || idx === actualEndIdx);
+          const isInRange = practiceMode === 'note' && idx >= actualStartIdx && idx <= actualEndIdx;
+          const isThisNoteHit = isInsideGate && isTargetHit;
 
-        for (let i = 1; i < rawContour.length; i++) {
-          const p1 = rawContour[i - 1];
-          const p2 = rawContour[i];
-          if (p1.midi <= 0 || p2.midi <= 0 || p2.time - p1.time > 0.22) continue;
-
-          const x1 = timeToX(p1.time);
-          const x2 = timeToX(p2.time);
-          if (x2 < leftMargin - 20 || x1 > width + 20) continue;
-
-          const y1 = midiToY(p1.midi);
-          const y2 = midiToY(p2.midi);
-
-          const isPassed = p2.time <= currentTime;
-          const isMatched = isPassed && isReferencePointMatchedByUser(p2.time, p2.midi, currentTime, history);
-
-          if (isMatched) {
-            ctx.strokeStyle = '#39ff14';
-            ctx.lineWidth = 4.5;
+          // Styling identical to Interactive Piano Roll with Section Range Highlight
+          if (isThisNoteHit) {
+            ctx.fillStyle = '#39ff14'; // Neon Green Hit!
             ctx.shadowColor = '#39ff14';
             ctx.shadowBlur = 14;
-          } else if (isPassed) {
-            // Passed but not matched: dim slate-blue
-            ctx.strokeStyle = 'rgba(100, 116, 139, 0.30)';
-            ctx.lineWidth = 3;
-            ctx.shadowBlur = 0;
+            ctx.strokeStyle = '#bbf7d0';
+            ctx.lineWidth = 2;
+          } else if (isInsideGate) {
+            ctx.fillStyle = '#38bdf8'; // Glowing Cyan Playhead
+            ctx.shadowColor = '#06b6d4';
+            ctx.shadowBlur = 12;
+            ctx.strokeStyle = '#e0f2fe';
+            ctx.lineWidth = 1.8;
+          } else if (isRangeBoundary) {
+            ctx.fillStyle = '#f59e0b'; // Vibrant Amber boundary
+            ctx.shadowColor = '#d97706';
+            ctx.shadowBlur = 12;
+            ctx.strokeStyle = '#fef08a';
+            ctx.lineWidth = 2;
+          } else if (isInRange) {
+            ctx.fillStyle = 'rgba(217, 119, 6, 0.75)'; // Amber inner section block
+            ctx.shadowColor = '#d97706';
+            ctx.shadowBlur = 6;
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 1.4;
           } else {
-            // Upcoming path ahead of cursor: clean silver-blue guide like reference video
-            ctx.strokeStyle = 'rgba(125, 211, 252, 0.36)';
-            ctx.lineWidth = 3.5;
+            ctx.fillStyle = '#0284c7'; // Deep ocean cyan from PianoRoll
             ctx.shadowBlur = 0;
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1;
           }
 
           ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
+          ctx.roundRect(x, y + 1, w, keyHeight - 2, 3.5);
+          ctx.fill();
           ctx.stroke();
-        }
-        ctx.shadowBlur = 0;
+          ctx.shadowBlur = 0;
 
-        // Subtle note labels along sustained plateaus
-        effectiveNotes.forEach((n) => {
-          if (n.duration < 0.28) return;
-          const nx = timeToX(n.start);
-          if (nx < leftMargin || nx > width) return;
-          const refY = getTargetMidiAtTime(n.start + 0.05) ?? n.midi;
-          const ny = midiToY(refY);
-          ctx.fillStyle = 'rgba(186, 230, 253, 0.65)';
-          ctx.font = 'bold 9px monospace';
-          ctx.fillText(n.note_name, nx + 2, ny - 10);
+          // Inner note name text label
+          if (w > 18) {
+            ctx.fillStyle = isThisNoteHit || isInsideGate ? '#0f172a' : '#ffffff';
+            ctx.font = 'bold 9px sans-serif';
+            ctx.fillText(n.note_name, x + 4, y + keyHeight - 4);
+          }
         });
-      } else if (hideReferenceGraph) {
-        ctx.fillStyle = 'rgba(148, 163, 184, 0.22)';
-        ctx.font = 'bold 12px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('BLIND MEMORY MODE — Sing from memory', leftMargin + plotWidth / 2, height / 2);
-        ctx.textAlign = 'left';
       }
 
-      // 3. Off-Pitch User Trace (Smooth Coral-Red trace behind cursor where user deviated from melody)
-      if (history.length > 1) {
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
+      // 4. Playhead Beam & Detection Gate
+      const beamColor = isTargetHit ? '#39ff14' : isLiveVoiced ? '#ef4444' : '#38bdf8';
+      ctx.strokeStyle = beamColor;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = beamColor;
+      ctx.shadowBlur = isTargetHit ? 14 : 8;
+      ctx.beginPath();
+      ctx.moveTo(gateX, 0);
+      ctx.lineTo(gateX, axisY);
+      ctx.stroke();
+      ctx.shadowBlur = 0;
 
-        for (let i = 1; i < history.length; i++) {
-          const p1 = history[i - 1];
-          const p2 = history[i];
-          if (p2.time - p1.time > 0.20 || p2.time > currentTime) continue;
+      // Live User Pitch Indicator on Playhead Gate
+      if (isLiveVoiced) {
+        const clampedMidi = Math.max(minMidi, Math.min(maxMidi, currentLive.midi));
+        const userY = midiToY(clampedMidi);
+        ctx.fillStyle = isTargetHit ? '#39ff14' : '#ef4444';
+        ctx.shadowColor = isTargetHit ? '#39ff14' : '#ef4444';
+        ctx.shadowBlur = 12;
 
-          const x1 = timeToX(p1.time);
-          const x2 = timeToX(p2.time);
-          if (x2 < leftMargin - 20 || x1 > width + 20) continue;
-
-          const isMatched = isUserPitchMatchedWithWindow(p2.time, p2.midi);
-          if (isMatched && !hideReferenceGraph) continue;
-
-          const y1 = midiToY(p1.midi);
-          const y2 = midiToY(p2.midi);
-
-          ctx.strokeStyle = hideReferenceGraph ? '#38bdf8' : '#ef4444';
-          ctx.lineWidth = 3.2;
-          ctx.shadowColor = hideReferenceGraph ? '#38bdf8' : '#ef4444';
-          ctx.shadowBlur = 8;
-
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.stroke();
-        }
+        ctx.beginPath();
+        ctx.roundRect(gateX - 16, userY + 1, 32, keyHeight - 2, 4);
+        ctx.fill();
         ctx.shadowBlur = 0;
+
+        ctx.fillStyle = '#0f172a';
+        ctx.font = 'bold 9px monospace';
+        ctx.fillText(currentLive.noteName, gateX - 11, userY + keyHeight - 4);
       }
 
       ctx.restore();
 
-      // 4. Scrolling Bottom Time Axis
+      // 5. Bottom Scrolling Time Axis
       ctx.fillStyle = '#0a101d';
       ctx.fillRect(0, axisY, width, 20);
       ctx.strokeStyle = '#1e293b';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(leftMargin, axisY);
+      ctx.moveTo(PIANO_WIDTH, axisY);
       ctx.lineTo(width, axisY);
       ctx.stroke();
 
-      const startSec = Math.max(0, Math.floor(currentTime - (centerX - leftMargin) / pixelsPerSecond));
-      const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - centerX) / pixelsPerSecond));
+      const startSec = Math.max(0, Math.floor(currentTime - (gateX - PIANO_WIDTH) / pixelsPerSecond));
+      const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - gateX) / pixelsPerSecond));
       ctx.fillStyle = '#64748b';
       ctx.font = '9px monospace';
       for (let t = startSec; t <= endSec; t += 1) {
         const tx = timeToX(t);
-        if (tx < leftMargin || tx > width) continue;
+        if (tx < PIANO_WIDTH || tx > width) continue;
         ctx.strokeStyle = '#334155';
         ctx.beginPath();
         ctx.moveTo(tx, axisY);
@@ -865,78 +1164,17 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         ctx.fillText(`${t}s`, tx - 6, height - 6);
       }
 
-      // 5. Fixed Center Playhead Beam & Concentric Live Pitch Ring Pointer
-      const beamGrad = ctx.createLinearGradient(centerX - 10, 0, centerX + 10, 0);
-      beamGrad.addColorStop(0, 'rgba(56, 189, 248, 0.0)');
-      beamGrad.addColorStop(0.5, 'rgba(56, 189, 248, 0.08)');
-      beamGrad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
-      ctx.fillStyle = beamGrad;
-      ctx.fillRect(centerX - 10, 0, 20, axisY);
-
-      ctx.strokeStyle = 'rgba(248, 250, 252, 0.30)';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.moveTo(centerX, 0);
-      ctx.lineTo(centerX, axisY);
-      ctx.stroke();
-
-      const currentLive = livePitchRef.current;
-      const targetMidiNow = getTargetMidiAtTime(currentTime);
-      let pointerMidi: number | null = null;
-      let isPointerInTune = true;
-
-      if (isPracticing && currentLive?.isVoiced) {
-        pointerMidi = currentLive.midi;
-        isPointerInTune = isUserPitchMatchedWithWindow(Math.max(0, currentTime - 0.15), currentLive.midi);
-      } else if (targetMidiNow !== null && !hideReferenceGraph) {
-        pointerMidi = targetMidiNow;
-        isPointerInTune = true;
-      }
-
-      if (pointerMidi !== null) {
-        const clampedMidi = Math.max(minMidi, Math.min(maxMidi, pointerMidi));
-        const ballY = midiToY(clampedMidi);
-        const ballColor =
-          isPracticing && currentLive?.isVoiced
-            ? (hideReferenceGraph ? '#38bdf8' : isPointerInTune ? '#39ff14' : '#ef4444')
-            : '#38bdf8';
-
-        ctx.save();
-        // Outer concentric halo ring
-        ctx.strokeStyle = ballColor;
-        ctx.globalAlpha = 0.45;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(centerX, ballY, 11, 0, Math.PI * 2);
-        ctx.stroke();
-
-        // Inner glowing core
-        ctx.globalAlpha = 1.0;
-        ctx.fillStyle = ballColor;
-        ctx.shadowColor = ballColor;
-        ctx.shadowBlur = 14;
-        ctx.beginPath();
-        ctx.arc(centerX, ballY, 5.5, 0, Math.PI * 2);
-        ctx.fill();
-
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.8;
-        ctx.stroke();
-        ctx.restore();
-      }
-
-      // Floating Current Second Badge on Fixed Center Playhead
       const timeText = `${currentTime.toFixed(2)}s`;
       ctx.font = 'bold 10px monospace';
       const textMetrics = ctx.measureText(timeText);
       const badgeW = textMetrics.width + 12;
       const badgeH = 18;
-      const badgeX = centerX - badgeW / 2;
-      const badgeY = 6;
+      const badgeX = gateX - badgeW / 2;
+      const badgeY = 4;
 
       ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = beamColor;
+      ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
       ctx.fill();
@@ -944,218 +1182,6 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
       ctx.fillStyle = '#ffffff';
       ctx.fillText(timeText, badgeX + 6, badgeY + 13);
-      return;
-    }
-
-    // =========================================================================
-    // INSTRUMENT MODE: Interactive Piano Roll View (Synced to Analysis Style)
-    // =========================================================================
-    const PIANO_WIDTH = 54;
-    const plotWidth = width - PIANO_WIDTH;
-    const gateX = PIANO_WIDTH + plotWidth * 0.25;
-    const pixelsPerSecond = 145;
-
-    const totalKeys = Math.max(12, midiRange + 1);
-    const keyHeight = Math.max(14, axisY / totalKeys);
-    const midiToY = (m: number) => (maxMidi - m) * keyHeight;
-    const timeToX = (t: number) => gateX + (t - currentTime) * pixelsPerSecond;
-
-    // Detect live pitch & target match
-    const currentLive = livePitchRef.current;
-    let activeGateNote: NoteItem | null = null;
-    effectiveNotes.forEach((n) => {
-      if (currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08) {
-        activeGateNote = n;
-      }
-    });
-
-    const isLiveVoiced = isPracticing && !!currentLive?.isVoiced;
-    const isTargetHit = isLiveVoiced && !!activeGateNote && Math.abs(currentLive.midi - activeGateNote.midi) <= 0.70;
-
-    // 1. Draw Grid Rows & Left Piano Keyboard
-    for (let m = maxMidi; m >= minMidi; m--) {
-      const y = midiToY(m);
-      if (y + keyHeight < 0 || y > axisY) continue;
-
-      const noteIdx = ((m % 12) + 12) % 12;
-      const isBlack = [1, 3, 6, 8, 10].includes(noteIdx);
-      const isKeyActive = isLiveVoiced && Math.round(currentLive.midi) === m;
-      const isKeyTarget = activeGateNote && activeGateNote.midi === m;
-
-      // Row background in DAW grid
-      ctx.fillStyle = isBlack ? '#0c1222' : '#0f172a';
-      ctx.fillRect(PIANO_WIDTH, y, width - PIANO_WIDTH, keyHeight);
-
-      // Horizontal grid line
-      ctx.strokeStyle = '#1e293b';
-      ctx.lineWidth = 0.5;
-      ctx.beginPath();
-      ctx.moveTo(PIANO_WIDTH, y + keyHeight);
-      ctx.lineTo(width, y + keyHeight);
-      ctx.stroke();
-
-      // Left Piano Key
-      if (isKeyActive) {
-        ctx.fillStyle = isTargetHit ? '#39ff14' : '#ef4444';
-        ctx.shadowColor = isTargetHit ? '#39ff14' : '#ef4444';
-        ctx.shadowBlur = 10;
-      } else if (isKeyTarget) {
-        ctx.fillStyle = '#0284c7';
-        ctx.shadowBlur = 0;
-      } else {
-        ctx.fillStyle = isBlack ? '#1e293b' : '#334155';
-        ctx.shadowBlur = 0;
-      }
-
-      ctx.fillRect(0, y, PIANO_WIDTH - 2, keyHeight - 1);
-      ctx.shadowBlur = 0;
-
-      // Key Note Label
-      ctx.fillStyle = isKeyActive ? '#0f172a' : isBlack ? '#94a3b8' : '#e2e8f0';
-      ctx.font = 'bold 8.5px monospace';
-      const octave = Math.floor(m / 12);
-      const noteName = `${NOTE_NAMES[noteIdx]}${octave}`;
-      if (!isBlack || noteIdx === 1 || noteIdx === 6 || isKeyActive) {
-        ctx.fillText(noteName, 4, y + keyHeight - 4);
-      }
-    }
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(PIANO_WIDTH, 0, plotWidth, axisY);
-    ctx.clip();
-
-    // 2. Beat & Time Vertical Grid Lines
-    drawMetronomeBeatGrid(ctx, timeToX, PIANO_WIDTH, width, axisY);
-
-    // 3. Render Piano Roll Note Rectangles
-    if (!hideReferenceGraph) {
-      effectiveNotes.forEach((n, idx) => {
-        const x = timeToX(n.start);
-        const w = Math.max(8, n.duration * pixelsPerSecond);
-        if (x + w < PIANO_WIDTH - 20 || x > width + 20) return;
-
-        const y = midiToY(n.midi);
-        const isInsideGate = currentTime >= n.start - 0.08 && currentTime <= n.end + 0.08;
-        const isSelectedInNoteMode = practiceMode === 'note' && idx === selectedNoteIndex;
-        const isThisNoteHit = isInsideGate && isTargetHit;
-
-        // Styling identical to Interactive Piano Roll
-        if (isThisNoteHit) {
-          ctx.fillStyle = '#39ff14'; // Neon Green Hit!
-          ctx.shadowColor = '#39ff14';
-          ctx.shadowBlur = 14;
-          ctx.strokeStyle = '#bbf7d0';
-          ctx.lineWidth = 2;
-        } else if (isInsideGate) {
-          ctx.fillStyle = '#38bdf8'; // Glowing Cyan Playhead
-          ctx.shadowColor = '#06b6d4';
-          ctx.shadowBlur = 12;
-          ctx.strokeStyle = '#e0f2fe';
-          ctx.lineWidth = 1.8;
-        } else if (isSelectedInNoteMode) {
-          ctx.fillStyle = '#f59e0b'; // Amber Selected
-          ctx.shadowColor = '#d97706';
-          ctx.shadowBlur = 10;
-          ctx.strokeStyle = '#fbbf24';
-          ctx.lineWidth = 2;
-        } else {
-          ctx.fillStyle = '#0284c7'; // Deep ocean cyan from PianoRoll
-          ctx.shadowBlur = 0;
-          ctx.strokeStyle = '#38bdf8';
-          ctx.lineWidth = 1;
-        }
-
-        ctx.beginPath();
-        ctx.roundRect(x, y + 1, w, keyHeight - 2, 3.5);
-        ctx.fill();
-        ctx.stroke();
-        ctx.shadowBlur = 0;
-
-        // Inner note name text label
-        if (w > 18) {
-          ctx.fillStyle = isThisNoteHit || isInsideGate ? '#0f172a' : '#ffffff';
-          ctx.font = 'bold 9px sans-serif';
-          ctx.fillText(n.note_name, x + 4, y + keyHeight - 4);
-        }
-      });
-    }
-
-    // 4. Playhead Beam & Detection Gate
-    const beamColor = isTargetHit ? '#39ff14' : isLiveVoiced ? '#ef4444' : '#38bdf8';
-    ctx.strokeStyle = beamColor;
-    ctx.lineWidth = 2;
-    ctx.shadowColor = beamColor;
-    ctx.shadowBlur = isTargetHit ? 14 : 8;
-    ctx.beginPath();
-    ctx.moveTo(gateX, 0);
-    ctx.lineTo(gateX, axisY);
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // Live User Pitch Indicator on Playhead Gate
-    if (isLiveVoiced) {
-      const clampedMidi = Math.max(minMidi, Math.min(maxMidi, currentLive.midi));
-      const userY = midiToY(clampedMidi);
-      ctx.fillStyle = isTargetHit ? '#39ff14' : '#ef4444';
-      ctx.shadowColor = isTargetHit ? '#39ff14' : '#ef4444';
-      ctx.shadowBlur = 12;
-
-      ctx.beginPath();
-      ctx.roundRect(gateX - 16, userY + 1, 32, keyHeight - 2, 4);
-      ctx.fill();
-      ctx.shadowBlur = 0;
-
-      ctx.fillStyle = '#0f172a';
-      ctx.font = 'bold 9px monospace';
-      ctx.fillText(currentLive.noteName, gateX - 11, userY + keyHeight - 4);
-    }
-
-    ctx.restore();
-
-    // 5. Bottom Scrolling Time Axis
-    ctx.fillStyle = '#0a101d';
-    ctx.fillRect(0, axisY, width, 20);
-    ctx.strokeStyle = '#1e293b';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(PIANO_WIDTH, axisY);
-    ctx.lineTo(width, axisY);
-    ctx.stroke();
-
-    const startSec = Math.max(0, Math.floor(currentTime - (gateX - PIANO_WIDTH) / pixelsPerSecond));
-    const endSec = Math.min(Math.ceil(duration), Math.ceil(currentTime + (width - gateX) / pixelsPerSecond));
-    ctx.fillStyle = '#64748b';
-    ctx.font = '9px monospace';
-    for (let t = startSec; t <= endSec; t += 1) {
-      const tx = timeToX(t);
-      if (tx < PIANO_WIDTH || tx > width) continue;
-      ctx.strokeStyle = '#334155';
-      ctx.beginPath();
-      ctx.moveTo(tx, axisY);
-      ctx.lineTo(tx, axisY + 4);
-      ctx.stroke();
-      ctx.fillText(`${t}s`, tx - 6, height - 6);
-    }
-
-    const timeText = `${currentTime.toFixed(2)}s`;
-    ctx.font = 'bold 10px monospace';
-    const textMetrics = ctx.measureText(timeText);
-    const badgeW = textMetrics.width + 12;
-    const badgeH = 18;
-    const badgeX = gateX - badgeW / 2;
-    const badgeY = 4;
-
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-    ctx.strokeStyle = beamColor;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 4);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(timeText, badgeX + 6, badgeY + 13);
     } catch (err) {
       console.error('Practice canvas render error:', err);
     }
@@ -1163,7 +1189,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   useEffect(() => {
     drawPracticeCanvas();
-  }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, selectedNoteIndex, studioType, blindMode, showPostBlindAnalysis, metronomeGrid]);
+  }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, rangeStartIndex, rangeEndIndex, studioType, blindMode, showPostBlindAnalysis, metronomeGrid]);
 
   // Click directly on canvas to select and audition a note
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -1197,7 +1223,16 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       const nh = studioType === 'instrument' ? keyHeight : 18;
 
       if (clickX >= nx - 4 && clickX <= nx + nw + 4 && clickY >= ny - 4 && clickY <= ny + nh + 4) {
-        setSelectedNoteIndex(i);
+        if (e.shiftKey) {
+          if (i < rangeStartIndex) {
+            setRangeStartIndex(i);
+          } else {
+            setRangeEndIndex(i);
+          }
+        } else {
+          setRangeStartIndex(i);
+          setRangeEndIndex(i);
+        }
         if (practiceMode !== 'note') {
           setPracticeMode('note');
         }
@@ -1227,11 +1262,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       <div className="daw-panel p-6 border border-slate-800 bg-slate-900/60 rounded-2xl shadow-xl space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className={`p-3 rounded-2xl border transition-all ${
-              micActive
-                ? 'bg-emerald-950 border-emerald-600/70 text-emerald-400 shadow-lg shadow-emerald-500/20'
-                : 'bg-slate-950 border-slate-800 text-slate-400'
-            }`}>
+            <div className={`p-3 rounded-2xl border transition-all ${micActive
+              ? 'bg-emerald-950 border-emerald-600/70 text-emerald-400 shadow-lg shadow-emerald-500/20'
+              : 'bg-slate-950 border-slate-800 text-slate-400'
+              }`}>
               {micActive ? <Mic className="w-5 h-5 animate-pulse" /> : <MicOff className="w-5 h-5" />}
             </div>
             <div>
@@ -1246,11 +1280,11 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               <p className="text-xs text-slate-400">
                 {studioType === 'instrument'
                   ? (practiceMode === 'note'
-                      ? 'Note-by-Note Mode: Play along with target notes on the Interactive Piano Roll.'
-                      : 'Full Song Mode: Play your instrument along with the scrolling Piano Roll while tracking pitch and timing in real time.')
+                    ? 'Section & Phrase Mode: Loop and master specific musical phrases or notes on the Piano Roll.'
+                    : 'Full Song Mode: Play your instrument along with the scrolling Piano Roll while tracking pitch and timing in real time.')
                   : (practiceMode === 'note'
-                      ? 'Note-by-Note Mode: Focus and master one target note at a time.'
-                      : 'Full Song Mode: Sing along with the melody while the studio measures your vocal pitch.')}
+                    ? 'Section & Phrase Mode: Master specific melody phrases or notes one section at a time.'
+                    : 'Full Song Mode: Sing along with the melody while the studio measures your vocal pitch.')}
               </p>
             </div>
           </div>
@@ -1282,11 +1316,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             {/* Track Mute / Unmute Icon */}
             <button
               onClick={toggleMute}
-              className={`p-2.5 rounded-xl border transition-all flex items-center justify-center ${
-                isMuted
-                  ? 'bg-rose-950/70 border-rose-700/70 text-rose-400 hover:bg-rose-900/80 shadow-md shadow-rose-950/50'
-                  : 'bg-slate-950/90 border-slate-800 text-slate-300 hover:text-cyan-300 hover:border-slate-700 shadow-sm'
-              }`}
+              className={`p-2.5 rounded-xl border transition-all flex items-center justify-center ${isMuted
+                ? 'bg-rose-950/70 border-rose-700/70 text-rose-400 hover:bg-rose-900/80 shadow-md shadow-rose-950/50'
+                : 'bg-slate-950/90 border-slate-800 text-slate-300 hover:text-cyan-300 hover:border-slate-700 shadow-sm'
+                }`}
               title={isMuted ? "Unmute Reference Track" : "Mute Reference Track (Sing A Cappella)"}
               aria-label={isMuted ? "Unmute Reference Track" : "Mute Reference Track"}
             >
@@ -1310,7 +1343,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                     className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
                   >
                     <Play className="w-4 h-4 fill-current ml-0.5" />
-                    {practiceMode === 'note' ? 'Practice Note' : 'Start Practice Session'}
+                    {practiceMode === 'note' ? (actualStartIdx === actualEndIdx ? 'Practice Note' : `Practice Section (${selectedSectionNotes.length} Notes)`) : 'Start Practice Session'}
                   </button>
 
                   <button
@@ -1357,22 +1390,20 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
                 <button
                   onClick={() => setStudioType('vocal')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                    studioType === 'vocal'
-                      ? 'bg-emerald-950/60 border border-emerald-500/60 text-emerald-300 shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${studioType === 'vocal'
+                    ? 'bg-emerald-950/60 border border-emerald-500/60 text-emerald-300 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                    }`}
                 >
                   <Mic2 className="w-3.5 h-3.5" />
                   <span>Vocal</span>
                 </button>
                 <button
                   onClick={() => setStudioType('instrument')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                    studioType === 'instrument'
-                      ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${studioType === 'instrument'
+                    ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                    }`}
                 >
                   <Piano className="w-3.5 h-3.5" />
                   <span>Instrument</span>
@@ -1388,11 +1419,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                   cancelCountdown();
                   setPracticeMode('full');
                 }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  practiceMode === 'full'
-                    ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${practiceMode === 'full'
+                  ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+                  }`}
               >
                 <Music className="w-3.5 h-3.5" />
                 <span>Full Song Mode</span>
@@ -1403,14 +1433,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                   cancelCountdown();
                   setPracticeMode('note');
                 }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  practiceMode === 'note'
-                    ? 'bg-amber-950/50 border border-amber-500/60 text-amber-300 shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${practiceMode === 'note'
+                  ? 'bg-amber-950/50 border border-amber-500/60 text-amber-300 shadow-sm'
+                  : 'text-slate-400 hover:text-slate-200'
+                  }`}
               >
                 <Target className="w-3.5 h-3.5" />
-                <span>Note-by-Note Mode</span>
+                <span>Section & Phrase Mode</span>
               </button>
             </div>
 
@@ -1420,11 +1449,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 setBlindMode((prev) => !prev);
                 setShowPostBlindAnalysis(false);
               }}
-              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition-all ${
-                blindMode
-                  ? 'bg-purple-950/60 border-purple-500/60 text-purple-300 shadow-sm'
-                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-              }`}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-semibold transition-all ${blindMode
+                ? 'bg-purple-950/60 border-purple-500/60 text-purple-300 shadow-sm'
+                : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
               title="Hide target graph while singing to test memorization, then reveal comparison after stopping"
             >
               {blindMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
@@ -1434,123 +1462,300 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
           <div className="text-xs text-slate-500">
             {practiceMode === 'note'
-              ? 'Click any note on the timeline or use buttons below to switch target'
+              ? 'Select start & end notes below to practice a section, or click any note to isolate it'
               : studioType === 'vocal'
-              ? 'Zoomed scrolling contour — center cursor tracks your voice in real time'
-              : 'Rhythm Gate mode — play notes accurately as they pass through the gate'}
+                ? 'Zoomed scrolling contour — center cursor tracks your voice in real time'
+                : 'Rhythm Gate mode — play notes accurately as they pass through the gate'}
           </div>
         </div>
 
-        {/* Note-by-Note Dedicated Control Toolbar */}
+        {/* Section & Phrase Practice Dedicated Toolbar */}
         {practiceMode === 'note' && (
-          <div className="p-3.5 rounded-xl bg-slate-950/90 border border-amber-500/30 flex flex-wrap items-center justify-between gap-3">
-            {/* Note Stepping & Audition */}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => {
-                    const nextIdx = Math.max(0, selectedNoteIndex - 1);
-                    setSelectedNoteIndex(nextIdx);
-                    const note = effectiveNotes[nextIdx];
-                    if (note) {
-                      synth.playMidiNote(note.midi, 0.4);
-                      if (audioRef.current && !isPracticing) {
-                        audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                        setCurrentTimeDisplay(audioRef.current.currentTime);
+          <div className="p-4 sm:p-5 rounded-2xl bg-slate-950/85 border border-slate-800/80 shadow-xl flex flex-col gap-4" style={{ gap: '14px' }}>
+            {/* Top Row: Steppers, Section Range Badge & Action Buttons */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* Steppers */}
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => {
+                      const span = actualEndIdx - actualStartIdx;
+                      const step = span > 0 ? span + 1 : 1;
+                      const newStart = Math.max(0, actualStartIdx - step);
+                      const newEnd = Math.max(newStart, actualEndIdx - step);
+                      setRangeStartIndex(newStart);
+                      setRangeEndIndex(newEnd);
+                      const note = effectiveNotes[newStart];
+                      if (note) {
+                        synth.playMidiNote(note.midi, 0.4);
+                        if (audioRef.current && !isPracticing) {
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          setCurrentTimeDisplay(audioRef.current.currentTime);
+                        }
                       }
-                    }
-                  }}
-                  disabled={selectedNoteIndex <= 0}
-                  className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                  title="Previous Note (←)"
-                >
-                  <ChevronLeft className="w-4 h-4" />
-                </button>
-                <button
-                  onClick={() => {
-                    const nextIdx = Math.min(effectiveNotes.length - 1, selectedNoteIndex + 1);
-                    setSelectedNoteIndex(nextIdx);
-                    const note = effectiveNotes[nextIdx];
-                    if (note) {
-                      synth.playMidiNote(note.midi, 0.4);
-                      if (audioRef.current && !isPracticing) {
-                        audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                        setCurrentTimeDisplay(audioRef.current.currentTime);
+                    }}
+                    disabled={actualStartIdx <= 0}
+                    className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all shadow-sm cursor-pointer"
+                    title="Previous Phrase / Note (←)"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={() => {
+                      const span = actualEndIdx - actualStartIdx;
+                      const step = span > 0 ? span + 1 : 1;
+                      const newStart = Math.min(effectiveNotes.length - 1, actualStartIdx + step);
+                      const newEnd = Math.min(effectiveNotes.length - 1, actualEndIdx + step);
+                      setRangeStartIndex(newStart);
+                      setRangeEndIndex(newEnd);
+                      const note = effectiveNotes[newStart];
+                      if (note) {
+                        synth.playMidiNote(note.midi, 0.4);
+                        if (audioRef.current && !isPracticing) {
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          setCurrentTimeDisplay(audioRef.current.currentTime);
+                        }
                       }
-                    }
-                  }}
-                  disabled={selectedNoteIndex >= effectiveNotes.length - 1}
-                  className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-                  title="Next Note (→)"
-                >
-                  <ChevronRight className="w-4 h-4" />
-                </button>
+                    }}
+                    disabled={actualEndIdx >= effectiveNotes.length - 1}
+                    className="p-1.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-all shadow-sm cursor-pointer"
+                    title="Next Phrase / Note (→)"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* Target Section Badge */}
+                {rangeStartNote && rangeEndNote && (
+                  <div className="flex items-center gap-2 px-3.5 py-1.5 bg-amber-950/40 border border-amber-500/40 rounded-xl shadow-inner">
+                    <Target className="w-4 h-4 text-amber-400 shrink-0" />
+                    {actualStartIdx === actualEndIdx ? (
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-slate-400">Target Note #{actualStartIdx + 1}/{effectiveNotes.length}:</span>
+                        <strong className="text-sm font-mono font-bold text-amber-300">{rangeStartNote.note_name}</strong>
+                        <span className="text-slate-400 font-mono">({rangeStartNote.frequency.toFixed(1)} Hz)</span>
+                        <span className="text-slate-500 font-mono">[{rangeStartNote.start.toFixed(2)}s - {rangeStartNote.end.toFixed(2)}s]</span>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="text-slate-400">Section Range:</span>
+                        <strong className="text-sm font-mono font-bold text-amber-300">
+                          #{actualStartIdx + 1} ({rangeStartNote.note_name}) → #{actualEndIdx + 1} ({rangeEndNote.note_name})
+                        </strong>
+                        <span className="px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 font-mono font-semibold">
+                          {selectedSectionNotes.length} Notes
+                        </span>
+                        <span className="text-slate-400 font-mono">
+                          [{rangeStartNote.start.toFixed(2)}s - {rangeEndNote.end.toFixed(2)}s] ({(rangeEndNote.end - rangeStartNote.start).toFixed(2)}s)
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
-              {/* Target Note Badge */}
-              {selectedNote && (
-                <div className="flex items-center gap-2 px-3 py-1 bg-amber-950/40 border border-amber-500/40 rounded-xl">
-                  <Target className="w-4 h-4 text-amber-400" />
-                  <span className="text-xs text-slate-400">Target Note {selectedNoteIndex + 1}/{effectiveNotes.length}:</span>
-                  <strong className="text-sm font-mono font-bold text-amber-300">{selectedNote.note_name}</strong>
-                  <span className="text-xs text-slate-400 font-mono">({selectedNote.frequency.toFixed(1)} Hz)</span>
-                  <span className="text-xs text-slate-500 font-mono">[{selectedNote.start.toFixed(2)}s - {selectedNote.end.toFixed(2)}s]</span>
-                </div>
-              )}
+              {/* Action Buttons: Single Note, Audition, Loop */}
+              <div className="flex items-center gap-2">
+                {actualStartIdx !== actualEndIdx && (
+                  <button
+                    onClick={() => {
+                      setRangeEndIndex(actualStartIdx);
+                    }}
+                    className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-slate-300 hover:text-white transition-all shadow-sm cursor-pointer"
+                    title="Collapse section to single note"
+                  >
+                    Single Note
+                  </button>
+                )}
 
-              {/* Audition Note with Synth */}
-              {selectedNote && (
+                {/* Audition Section Pitch / Audio */}
                 <button
-                  onClick={() => synth.playMidiNote(selectedNote.midi, 0.6)}
-                  className="flex items-center gap-1.5 px-3 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-cyan-300 transition-all"
-                  title="Hear target note pitch with reference synth"
-                >
-                  <Volume2 className="w-3.5 h-3.5" />
-                  <span>Hear Pitch</span>
-                </button>
-              )}
-
-              {/* Loop Note Toggle */}
-              <button
-                onClick={() => setLoopNote((prev) => !prev)}
-                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
-                  loopNote
-                    ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
-                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                }`}
-                title="Loop playback on this specific note"
-              >
-                <Repeat className="w-3.5 h-3.5" />
-                <span>Loop Note</span>
-              </button>
-            </div>
-
-            {/* Quick Note Selector Carousel */}
-            <div className="flex items-center gap-1.5 overflow-x-auto max-w-full py-1">
-              {effectiveNotes.map((note, idx) => (
-                <button
-                  key={note.id || idx}
                   onClick={() => {
-                    setSelectedNoteIndex(idx);
-                    synth.playMidiNote(note.midi, 0.4);
-                    if (audioRef.current && !isPracticing) {
-                      audioRef.current.currentTime = Math.max(0, note.start - 0.1);
-                      setCurrentTimeDisplay(audioRef.current.currentTime);
+                    if (audioRef.current && rangeStartNote && rangeEndNote) {
+                      audioRef.current.currentTime = Math.max(0, rangeStartNote.start - 0.08);
+                      audioRef.current.play();
+                      const durMs = Math.max(300, (rangeEndNote.end - rangeStartNote.start + 0.15) * 1000 / playbackSpeed);
+                      setTimeout(() => {
+                        if (!isPracticing && audioRef.current) {
+                          audioRef.current.pause();
+                        }
+                      }, durMs);
+                    } else if (rangeStartNote) {
+                      synth.playMidiNote(rangeStartNote.midi, 0.6);
                     }
                   }}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold transition-all shrink-0 ${
-                    idx === selectedNoteIndex
-                      ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/30'
-                      : 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
-                  }`}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg text-xs font-semibold text-cyan-300 transition-all shadow-sm cursor-pointer"
+                  title="Audition the selected section audio"
                 >
-                  {idx + 1}. {note.note_name}
+                  <Volume2 className="w-3.5 h-3.5" />
+                  <span>{actualStartIdx === actualEndIdx ? 'Hear Pitch' : 'Hear Section'}</span>
                 </button>
-              ))}
+
+                {/* Loop Section Toggle */}
+                <button
+                  onClick={() => setLoopSection((prev) => !prev)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all shadow-sm cursor-pointer ${loopSection
+                    ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  title="Continuously loop this phrase or note during practice"
+                >
+                  <Repeat className="w-3.5 h-3.5" />
+                  <span>{actualStartIdx === actualEndIdx ? 'Loop Note' : 'Loop Section'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Middle Row: Start & End Note Selectors & Quick Presets */}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/60" style={{ marginTop: '12px', paddingTop: '12px' }}>
+              <div className="flex flex-wrap items-center gap-3 text-xs">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-400 font-medium">From Note:</span>
+                  <select
+                    value={actualStartIdx}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setRangeStartIndex(val);
+                      if (val > actualEndIdx) {
+                        setRangeEndIndex(val);
+                      }
+                      const note = effectiveNotes[val];
+                      if (note) {
+                        synth.playMidiNote(note.midi, 0.35);
+                        if (audioRef.current && !isPracticing) {
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          setCurrentTimeDisplay(audioRef.current.currentTime);
+                        }
+                      }
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-amber-300 font-mono text-xs focus:outline-none focus:border-amber-400 shadow-sm cursor-pointer"
+                  >
+                    {effectiveNotes.map((n, i) => (
+                      <option key={`start_${n.id || i}`} value={i}>
+                        #{i + 1}: {n.note_name} ({n.start.toFixed(2)}s)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <span className="text-slate-400 font-medium">To Note:</span>
+                  <select
+                    value={actualEndIdx}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setRangeEndIndex(val);
+                      if (val < actualStartIdx) {
+                        setRangeStartIndex(val);
+                      }
+                      const note = effectiveNotes[val];
+                      if (note) {
+                        synth.playMidiNote(note.midi, 0.35);
+                      }
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-700 text-amber-300 font-mono text-xs focus:outline-none focus:border-amber-400 shadow-sm cursor-pointer"
+                  >
+                    {effectiveNotes.map((n, i) => (
+                      <option key={`end_${n.id || i}`} value={i}>
+                        #{i + 1}: {n.note_name} ({n.end.toFixed(2)}s)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <span className="text-[11px] text-slate-500">
+                  • Click any note pill to set start/end, or Shift-click to extend range
+                </span>
+              </div>
+
+              {/* Quick Preset Buttons */}
+              <div className="flex items-center gap-1.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRangeStartIndex(0);
+                    setRangeEndIndex(Math.min(3, effectiveNotes.length - 1));
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white transition text-xs font-medium cursor-pointer shadow-sm"
+                >
+                  Intro (4 Notes)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRangeStartIndex(0);
+                    setRangeEndIndex(effectiveNotes.length - 1);
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-white transition text-xs font-medium cursor-pointer shadow-sm"
+                >
+                  All Notes
+                </button>
+              </div>
+            </div>
+
+            {/* Bottom Row: Interactive Note Pills Track inside a cushioned container with soft white border */}
+            <div className="rounded-xl bg-slate-950/60 p-2.5 sm:p-3 shadow-inner border border-solid" style={{ borderColor: 'rgba(255, 255, 255, 0.08)' }}>
+              <div className="flex items-center gap-1.5 overflow-x-auto max-w-full py-0.5 px-0.5">
+                {effectiveNotes.map((note, idx) => {
+                  const isStart = idx === actualStartIdx;
+                  const isEnd = idx === actualEndIdx;
+                  const isInRange = idx >= actualStartIdx && idx <= actualEndIdx;
+
+                  return (
+                    <button
+                      key={note.id || idx}
+                      type="button"
+                      onClick={(e) => {
+                        if (e.shiftKey) {
+                          if (idx < actualStartIdx) {
+                            setRangeStartIndex(idx);
+                          } else {
+                            setRangeEndIndex(idx);
+                          }
+                        } else {
+                          if (actualStartIdx === actualEndIdx && idx !== actualStartIdx) {
+                            if (idx > actualStartIdx) {
+                              setRangeEndIndex(idx);
+                            } else {
+                              setRangeStartIndex(idx);
+                            }
+                          } else {
+                            setRangeStartIndex(idx);
+                            setRangeEndIndex(idx);
+                          }
+                        }
+                        synth.playMidiNote(note.midi, 0.4);
+                        if (audioRef.current && !isPracticing) {
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          setCurrentTimeDisplay(audioRef.current.currentTime);
+                        }
+                      }}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all shrink-0 flex items-center gap-1.5 cursor-pointer ${isStart || isEnd
+                        ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/25 ring-2 ring-amber-300'
+                        : isInRange
+                          ? 'bg-amber-950/70 border border-amber-600/70 text-amber-300 shadow-sm'
+                          : 'bg-slate-900/90 border border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'
+                        }`}
+                      title={`Note #${idx + 1}: ${note.note_name} [${note.start.toFixed(2)}s - ${note.end.toFixed(2)}s]. Click to select, Shift-click to extend.`}
+                    >
+                      {isStart && actualStartIdx !== actualEndIdx && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded-md bg-slate-950 text-amber-300 font-extrabold leading-none">
+                          START
+                        </span>
+                      )}
+                      <span>{idx + 1}. {note.note_name}</span>
+                      {isEnd && actualStartIdx !== actualEndIdx && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded-md bg-slate-950 text-amber-300 font-extrabold leading-none">
+                          END
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         )}
-
         {/* Live Pitch Gauge / Meter */}
         <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800/80 grid grid-cols-1 md:grid-cols-4 gap-4 items-center">
           {/* Note Display */}
@@ -1585,9 +1790,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-slate-400 z-10"></div>
               {livePitch?.isVoiced && (
                 <div
-                  className={`h-full transition-all duration-75 ${
-                    Math.abs(livePitch.centsDeviation) <= 15 ? 'bg-emerald-400' : 'bg-amber-400'
-                  }`}
+                  className={`h-full transition-all duration-75 ${Math.abs(livePitch.centsDeviation) <= 15 ? 'bg-emerald-400' : 'bg-amber-400'
+                    }`}
                   style={{
                     width: `${Math.min(50, Math.abs(livePitch.centsDeviation))}%`,
                     marginLeft: livePitch.centsDeviation >= 0 ? '50%' : `${50 - Math.min(50, Math.abs(livePitch.centsDeviation))}%`,
@@ -1644,11 +1848,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 <button
                   key={rate}
                   onClick={() => handleSpeedChange(rate)}
-                  className={`px-2 py-0.5 rounded-lg text-[11px] font-semibold transition-all ${
-                    playbackSpeed === rate
-                      ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300'
-                      : 'text-slate-500 hover:text-slate-300'
-                  }`}
+                  className={`px-2 py-0.5 rounded-lg text-[11px] font-semibold transition-all ${playbackSpeed === rate
+                    ? 'bg-cyan-950 border border-cyan-700/60 text-cyan-300'
+                    : 'text-slate-500 hover:text-slate-300'
+                    }`}
                 >
                   {Math.round(rate * 100)}%
                 </button>
@@ -1660,11 +1863,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 p-1 rounded-xl">
             <button
               onClick={() => setCountdownEnabled((prev) => !prev)}
-              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${
-                countdownEnabled
-                  ? 'bg-cyan-950 border border-cyan-800/60 text-cyan-300'
-                  : 'text-slate-500 hover:text-slate-300'
-              }`}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${countdownEnabled
+                ? 'bg-cyan-950 border border-cyan-800/60 text-cyan-300'
+                : 'text-slate-500 hover:text-slate-300'
+                }`}
               title={countdownEnabled ? "Disable pre-practice countdown" : "Enable pre-practice countdown"}
             >
               <Timer className="w-3.5 h-3.5" />
