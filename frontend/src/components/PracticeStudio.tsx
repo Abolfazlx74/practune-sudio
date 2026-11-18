@@ -109,6 +109,12 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [rangeStartIndex, setRangeStartIndex] = useState<number>(0);
   const [rangeEndIndex, setRangeEndIndex] = useState<number>(0);
   const [loopSection, setLoopSection] = useState<boolean>(true);
+  const [loopRepeatCount, setLoopRepeatCount] = useState<number>(0); // 0 = infinite (continuous), 1 = 1x, 2 = 2x...
+  const [loopDelayEnabled, setLoopDelayEnabled] = useState<boolean>(false);
+  const [loopDelayCountdown, setLoopDelayCountdown] = useState<number | null>(null);
+  const currentLoopIterationRef = useRef<number>(1);
+  const isLoopDelayingRef = useRef<boolean>(false);
+  const loopDelayTimerRef = useRef<number | null>(null);
 
   // Backward compatibility alias for single-note references
   const actualStartIdx = Math.min(rangeStartIndex, rangeEndIndex);
@@ -339,7 +345,53 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const selectedSectionNotes: NoteItem[] = effectiveNotes.slice(actualStartIdx, actualEndIdx + 1);
   const selectedNote: NoteItem | undefined = rangeStartNote;
 
-  // Stop mic and countdown on unmount
+  // Cancel loop delay interstitial
+  const cancelLoopDelay = () => {
+    if (loopDelayTimerRef.current) {
+      clearInterval(loopDelayTimerRef.current);
+      loopDelayTimerRef.current = null;
+    }
+    isLoopDelayingRef.current = false;
+    setLoopDelayCountdown(null);
+  };
+
+  // Trigger pause between loop iterations using countdownDuration lead-in seconds
+  const triggerLoopDelay = (nextIteration: number, loopStart: number) => {
+    if (!audioRef.current || isLoopDelayingRef.current) return;
+    isLoopDelayingRef.current = true;
+    audioRef.current.pause();
+
+    const delaySecs = countdownDuration > 0 ? countdownDuration : 3;
+    let remaining = delaySecs;
+    setLoopDelayCountdown(remaining);
+    playCountdownBeep(false);
+
+    if (loopDelayTimerRef.current) {
+      clearInterval(loopDelayTimerRef.current);
+    }
+
+    loopDelayTimerRef.current = window.setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) {
+        setLoopDelayCountdown(remaining);
+        playCountdownBeep(false);
+      } else {
+        if (loopDelayTimerRef.current) {
+          clearInterval(loopDelayTimerRef.current);
+          loopDelayTimerRef.current = null;
+        }
+        playCountdownBeep(true);
+        setLoopDelayCountdown(null);
+        isLoopDelayingRef.current = false;
+        if (audioRef.current) {
+          audioRef.current.currentTime = loopStart;
+          audioRef.current.play().catch(() => {});
+        }
+      }
+    }, 1000);
+  };
+
+  // Stop mic, countdown and loop timers on unmount
   useEffect(() => {
     return () => {
       if (trackerRef.current) {
@@ -348,20 +400,42 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       if (countdownIntervalRef.current) {
         clearInterval(countdownIntervalRef.current);
       }
+      if (loopDelayTimerRef.current) {
+        clearInterval(loopDelayTimerRef.current);
+      }
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
   }, []);
 
-  // Cancel countdown if Escape key is pressed
+  // Global Spacebar (Play / Stop & Evaluate) and Escape keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && countdownValue !== null) {
-        cancelCountdown();
+      // Don't trigger if user is typing in an input, textarea, or select
+      const activeTag = document.activeElement?.tagName.toLowerCase();
+      if (activeTag === 'input' || activeTag === 'textarea' || activeTag === 'select') {
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        if (countdownValue !== null) {
+          cancelCountdown();
+        } else if (loopDelayCountdown !== null) {
+          cancelLoopDelay();
+        }
+      } else if (e.code === 'Space' || e.key === ' ') {
+        e.preventDefault();
+        if (isPracticing) {
+          stopPracticeSession();
+        } else if (countdownValue !== null) {
+          cancelCountdown();
+        } else {
+          handleStartPracticeClick();
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [countdownValue]);
+  }, [isPracticing, countdownValue, countdownEnabled, countdownDuration, loopDelayCountdown, practiceMode, rangeStartNote]);
 
   // Audio beep generator for studio countdown lead-in
   const playCountdownBeep = (isFinal: boolean) => {
@@ -454,12 +528,21 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         }
       });
 
+      cancelLoopDelay();
+      currentLoopIterationRef.current = 1;
+      isLoopDelayingRef.current = false;
+      setLoopDelayCountdown(null);
       setMicActive(true);
       setIsPracticing(true);
 
       if (audioRef.current) {
         if (practiceMode === 'note' && rangeStartNote) {
-          audioRef.current.currentTime = Math.max(0, rangeStartNote.start - 0.15);
+          const prevNote = effectiveNotes[actualStartIdx - 1];
+          let startSec = Math.max(0, rangeStartNote.start - 0.02);
+          if (prevNote) {
+            startSec = Math.max(prevNote.end, rangeStartNote.start - 0.02);
+          }
+          audioRef.current.currentTime = startSec;
         } else {
           audioRef.current.currentTime = 0;
         }
@@ -479,6 +562,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   const stopPracticeSession = async () => {
     cancelCountdown();
+    cancelLoopDelay();
     if (trackerRef.current) {
       trackerRef.current.stop();
     }
@@ -696,12 +780,42 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
       const currentTime = audioRef.current ? audioRef.current.currentTime : 0;
 
-      // Handle section / note looping during active practice
-      if (isPracticing && practiceMode === 'note' && rangeStartNote && rangeEndNote && loopSection && audioRef.current) {
-        const loopEnd = rangeEndNote.end + 0.2;
-        const loopStart = Math.max(0, rangeStartNote.start - 0.15);
-        if (currentTime >= loopEnd) {
-          audioRef.current.currentTime = loopStart;
+      // Handle section / phrase looping & repeat limits during active practice
+      if (isPracticing && practiceMode === 'note' && rangeStartNote && rangeEndNote && audioRef.current) {
+        const nextNote = effectiveNotes[actualEndIdx + 1];
+        const prevNote = effectiveNotes[actualStartIdx - 1];
+
+        // Ensure cutoff is strictly before the next note starts (prevent bleed into next note)
+        let loopEnd = rangeEndNote.end;
+        if (nextNote) {
+          loopEnd = Math.min(rangeEndNote.end, Math.max(rangeEndNote.start + 0.04, nextNote.start - 0.025));
+        }
+
+        // Clean start at note onset without bleeding from previous note
+        let loopStart = Math.max(0, rangeStartNote.start - 0.02);
+        if (prevNote) {
+          loopStart = Math.max(prevNote.end, rangeStartNote.start - 0.02);
+        }
+
+        if (currentTime >= loopEnd && !isLoopDelayingRef.current) {
+          if (!loopSection) {
+            // Loop is OFF: finish session and evaluate immediately
+            stopPracticeSession();
+          } else {
+            // Loop is ON: check repetition count
+            const nextIteration = currentLoopIterationRef.current + 1;
+            if (loopRepeatCount > 0 && currentLoopIterationRef.current >= loopRepeatCount) {
+              // Target repeat count reached: finish session and evaluate
+              stopPracticeSession();
+            } else {
+              currentLoopIterationRef.current = nextIteration;
+              if (loopDelayEnabled) {
+                triggerLoopDelay(nextIteration, loopStart);
+              } else {
+                audioRef.current.currentTime = loopStart;
+              }
+            }
+          }
         }
       }
 
@@ -1182,6 +1296,24 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
       ctx.fillStyle = '#ffffff';
       ctx.fillText(timeText, badgeX + 6, badgeY + 13);
+
+      // Overlay for interstitial loop delay countdown
+      if (isPracticing && loopDelayCountdown !== null) {
+        ctx.save();
+        ctx.fillStyle = 'rgba(7, 11, 18, 0.82)';
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.fillStyle = '#f59e0b';
+        ctx.font = 'bold 15px sans-serif';
+        ctx.textAlign = 'center';
+        const loopLabel = loopRepeatCount > 0 ? `Loop ${currentLoopIterationRef.current}/${loopRepeatCount}` : `Loop ${currentLoopIterationRef.current}`;
+        ctx.fillText(`${loopLabel} • Next pass in ${loopDelayCountdown}s...`, width / 2, height / 2 - 10);
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '12px monospace';
+        ctx.fillText('Get ready to play next iteration', width / 2, height / 2 + 16);
+        ctx.restore();
+      }
     } catch (err) {
       console.error('Practice canvas render error:', err);
     }
@@ -1340,10 +1472,12 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 <div className="flex items-center gap-2">
                   <button
                     onClick={handleStartPracticeClick}
-                    className="flex items-center gap-2 px-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all"
+                    className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-sm shadow-lg shadow-emerald-500/25 transition-all cursor-pointer"
+                    title="Start Practice Session (or press Space)"
                   >
                     <Play className="w-4 h-4 fill-current ml-0.5" />
-                    {practiceMode === 'note' ? (actualStartIdx === actualEndIdx ? 'Practice Note' : `Practice Section (${selectedSectionNotes.length} Notes)`) : 'Start Practice Session'}
+                    <span>{practiceMode === 'note' ? (actualStartIdx === actualEndIdx ? 'Practice Note' : `Practice Section (${selectedSectionNotes.length} Notes)`) : 'Start Practice Session'}</span>
+                    <kbd className="ml-1 px-1.5 py-0.5 rounded bg-black/25 text-slate-950 border border-slate-900/30 text-[10px] font-mono font-bold tracking-tight">Space</kbd>
                   </button>
 
                   <button
@@ -1368,10 +1502,12 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             ) : (
               <button
                 onClick={stopPracticeSession}
-                className="flex items-center gap-2 px-6 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-sm shadow-lg shadow-rose-600/25 transition-all"
+                className="flex items-center gap-2 px-5 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-sm shadow-lg shadow-rose-600/25 transition-all cursor-pointer"
+                title="Finish & Evaluate Performance (or press Space)"
               >
                 <Square className="w-4 h-4 fill-current" />
-                Finish & Evaluate
+                <span>Finish & Evaluate</span>
+                <kbd className="ml-1 px-1.5 py-0.5 rounded bg-black/30 border border-white/20 text-[10px] font-mono text-white/90">Space</kbd>
               </button>
             )}
           </div>
@@ -1489,7 +1625,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                       if (note) {
                         synth.playMidiNote(note.midi, 0.4);
                         if (audioRef.current && !isPracticing) {
-                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.01);
                           setCurrentTimeDisplay(audioRef.current.currentTime);
                         }
                       }
@@ -1512,7 +1648,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                       if (note) {
                         synth.playMidiNote(note.midi, 0.4);
                         if (audioRef.current && !isPracticing) {
-                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.01);
                           setCurrentTimeDisplay(audioRef.current.currentTime);
                         }
                       }
@@ -1572,9 +1708,22 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                 <button
                   onClick={() => {
                     if (audioRef.current && rangeStartNote && rangeEndNote) {
-                      audioRef.current.currentTime = Math.max(0, rangeStartNote.start - 0.08);
+                      const prevNote = effectiveNotes[actualStartIdx - 1];
+                      const nextNote = effectiveNotes[actualEndIdx + 1];
+
+                      let auditStart = Math.max(0, rangeStartNote.start - 0.02);
+                      if (prevNote) {
+                        auditStart = Math.max(prevNote.end, rangeStartNote.start - 0.02);
+                      }
+
+                      let auditEnd = rangeEndNote.end;
+                      if (nextNote) {
+                        auditEnd = Math.min(rangeEndNote.end, Math.max(rangeEndNote.start + 0.04, nextNote.start - 0.025));
+                      }
+
+                      audioRef.current.currentTime = auditStart;
                       audioRef.current.play();
-                      const durMs = Math.max(300, (rangeEndNote.end - rangeStartNote.start + 0.15) * 1000 / playbackSpeed);
+                      const durMs = Math.max(60, (auditEnd - auditStart) * 1000 / playbackSpeed);
                       setTimeout(() => {
                         if (!isPracticing && audioRef.current) {
                           audioRef.current.pause();
@@ -1591,18 +1740,77 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                   <span>{actualStartIdx === actualEndIdx ? 'Hear Pitch' : 'Hear Section'}</span>
                 </button>
 
-                {/* Loop Section Toggle */}
-                <button
-                  onClick={() => setLoopSection((prev) => !prev)}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all shadow-sm cursor-pointer ${loopSection
-                    ? 'bg-emerald-950/60 border-emerald-600/60 text-emerald-400'
-                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                {/* Loop Toggle & Repeat Stepper (Lead-In Style) */}
+                <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 p-1 rounded-xl shadow-sm">
+                  <button
+                    type="button"
+                    onClick={() => setLoopSection((prev) => !prev)}
+                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                      loopSection
+                        ? 'bg-emerald-950 border border-emerald-700/70 text-emerald-300 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-300'
                     }`}
-                  title="Continuously loop this phrase or note during practice"
-                >
-                  <Repeat className="w-3.5 h-3.5" />
-                  <span>{actualStartIdx === actualEndIdx ? 'Loop Note' : 'Loop Section'}</span>
-                </button>
+                    title={loopSection ? "Disable loop" : "Enable continuous section loop"}
+                  >
+                    <Repeat className="w-3.5 h-3.5" />
+                    <span>Loop: {loopSection ? (loopRepeatCount === 0 ? '0 (∞)' : `${loopRepeatCount}x`) : 'Off'}</span>
+                  </button>
+
+                  {loopSection && (
+                    <div className="flex items-center gap-1 px-1 border-l border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => setLoopRepeatCount((c) => Math.max(0, c - 1))}
+                        disabled={loopRepeatCount <= 0}
+                        className="w-5 h-5 flex items-center justify-center rounded bg-slate-900 hover:bg-slate-800 text-slate-300 disabled:opacity-30 text-xs font-bold transition-colors cursor-pointer"
+                        title="Decrease repeats (0 = infinite)"
+                      >
+                        -
+                      </button>
+                      <span
+                        className="text-xs font-mono font-bold text-emerald-400 min-w-8 text-center select-none"
+                        title={loopRepeatCount === 0 ? "0: Infinite continuous loop" : `${loopRepeatCount} repetition(s)`}
+                      >
+                        {loopRepeatCount === 0 ? '0 (∞)' : `${loopRepeatCount}x`}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setLoopRepeatCount((c) => Math.min(50, c + 1))}
+                        disabled={loopRepeatCount >= 50}
+                        className="w-5 h-5 flex items-center justify-center rounded bg-slate-900 hover:bg-slate-800 text-slate-300 disabled:opacity-30 text-xs font-bold transition-colors cursor-pointer"
+                        title="Increase repeats"
+                      >
+                        +
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* Loop Delay Toggle (Active only when Loop is ON, uses Lead-In seconds) */}
+                <div className={`flex items-center gap-1.5 bg-slate-950 border p-1 rounded-xl shadow-sm transition-all ${
+                  !loopSection ? 'opacity-35 pointer-events-none border-slate-900' : 'border-slate-800'
+                }`}>
+                  <button
+                    type="button"
+                    onClick={() => setLoopDelayEnabled((prev) => !prev)}
+                    disabled={!loopSection}
+                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                      loopDelayEnabled && loopSection
+                        ? 'bg-amber-950 border border-amber-700/70 text-amber-300 shadow-sm'
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                    title={
+                      !loopSection
+                        ? "Enable Loop first to use Loop Delay"
+                        : loopDelayEnabled
+                        ? `Loop delay active: pauses ${countdownDuration}s between iterations`
+                        : `Enable ${countdownDuration}s pause between loop repeats (uses Lead-in time)`
+                    }
+                  >
+                    <Clock className="w-3.5 h-3.5" />
+                    <span>Delay: {loopDelayEnabled && loopSection ? `${countdownDuration}s` : 'Off'}</span>
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -1623,7 +1831,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                       if (note) {
                         synth.playMidiNote(note.midi, 0.35);
                         if (audioRef.current && !isPracticing) {
-                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.01);
                           setCurrentTimeDisplay(audioRef.current.currentTime);
                         }
                       }
@@ -1726,7 +1934,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                         }
                         synth.playMidiNote(note.midi, 0.4);
                         if (audioRef.current && !isPracticing) {
-                          audioRef.current.currentTime = Math.max(0, note.start - 0.1);
+                          audioRef.current.currentTime = Math.max(0, note.start - 0.01);
                           setCurrentTimeDisplay(audioRef.current.currentTime);
                         }
                       }}
