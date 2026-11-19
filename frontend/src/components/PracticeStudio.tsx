@@ -19,6 +19,7 @@ import {
   Mic2,
   Piano,
   Upload,
+  Layers,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
 import { MicPitchTracker } from '../services/micPitchTracker';
@@ -33,6 +34,28 @@ import { SmartMetronome } from './SmartMetronome';
 import type { MetronomeGridState } from './SmartMetronome';
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+/**
+ * Checks if the reference notes contain any simultaneous / overlapping notes (polyphony)
+ */
+function hasPolyphonicNotes(notes: NoteItem[]): boolean {
+  if (!notes || notes.length < 2) return false;
+  const sorted = [...notes].sort((a, b) => a.start - b.start);
+  for (let i = 0; i < sorted.length; i++) {
+    const n1 = sorted[i];
+    for (let j = i + 1; j < sorted.length; j++) {
+      const n2 = sorted[j];
+      if (n2.start >= n1.end - 0.04) {
+        break;
+      }
+      const overlap = Math.min(n1.end, n2.end) - Math.max(n1.start, n2.start);
+      if (overlap >= 0.05 && n1.midi !== n2.midi) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 interface PracticeStudioProps {
   transcription: TranscriptionResult;
@@ -59,6 +82,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 }) => {
   // Practice session states
   const [isPracticing, setIsPracticing] = useState(false);
+  const isPracticingRef = useRef(false);
   const [micActive, setMicActive] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1.0);
@@ -87,6 +111,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setStudioType('instrument');
     }
   }, [isInstrumentLocked, studioType]);
+
+  // One-time polyphony decision for instrument mode based on initial transcription
+  const isPolyphonicInstrument = React.useMemo(() => {
+    if (studioType !== 'instrument') return false;
+    if (transcription.is_monophonic === false) return true;
+    return hasPolyphonicNotes(transcription.notes);
+  }, [studioType, transcription]);
   const [blindMode, setBlindMode] = useState<boolean>(false);
   const [showPostBlindAnalysis, setShowPostBlindAnalysis] = useState<boolean>(false);
 
@@ -284,10 +315,17 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       }
       return null;
     }
-    const refNote = practiceMode === 'note' && selectedNote
-      ? selectedNote
-      : effectiveNotes.find((n) => t >= n.start && t <= n.end);
-    return refNote ? refNote.midi : null;
+    const matchingNotes = effectiveNotes.filter((n) => t >= n.start - 0.08 && t <= n.end + 0.08);
+    if (matchingNotes.length === 1) return matchingNotes[0].midi;
+    if (matchingNotes.length > 1) {
+      // Pick the note whose center is closest to t
+      matchingNotes.sort((a, b) => Math.abs(t - (a.start + a.end) / 2) - Math.abs(t - (b.start + b.end) / 2));
+      return matchingNotes[0].midi;
+    }
+    if (practiceMode === 'note' && actualStartIdx === actualEndIdx && selectedNote) {
+      return selectedNote.midi;
+    }
+    return null;
   };
 
   // Check if a sung MIDI matches the reference contour within a ±0.20s window
@@ -504,35 +542,43 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       const tracker = new MicPitchTracker();
       trackerRef.current = tracker;
 
-      await tracker.start((data) => {
-        if (data.isVoiced && audioRef.current) {
-          const rawTime = audioRef.current.currentTime;
-          // Compensate ~150ms round-trip audio/DSP latency
-          const alignedTime = Math.max(0, Math.round((rawTime - 0.15) * 1000) / 1000);
-          const cleanMidi = stabilizeUserMidi(data.midi, alignedTime);
-          const stabilizedData: LivePitchData = { ...data, midi: cleanMidi };
-          livePitchRef.current = stabilizedData;
-          setLivePitch(stabilizedData);
+      // In polyphonic instrument mode, real-time single pitch tracking is paused for polyphony,
+      // while audio is recorded in high fidelity for complete final chord & note evaluation.
+      await tracker.start(
+        isPolyphonicInstrument
+          ? null
+          : (data) => {
+              if (data.isVoiced && audioRef.current) {
+                const rawTime = audioRef.current.currentTime;
+                // Compensate ~150ms round-trip audio/DSP latency
+                const alignedTime = Math.max(0, Math.round((rawTime - 0.15) * 1000) / 1000);
+                const cleanMidi = stabilizeUserMidi(data.midi, alignedTime);
+                const stabilizedData: LivePitchData = { ...data, midi: cleanMidi };
+                livePitchRef.current = stabilizedData;
+                setLivePitch(stabilizedData);
 
-          userPitchHistory.current.push({
-            time: alignedTime,
-            frequency: 440 * Math.pow(2, (cleanMidi - 69) / 12),
-            midi: cleanMidi,
-            confidence: data.confidence,
-          });
-        } else {
-          recentMicMidisRef.current = [];
-          smoothedMidiRef.current = null;
-          livePitchRef.current = data;
-          setLivePitch(data);
-        }
-      });
+                userPitchHistory.current.push({
+                  time: alignedTime,
+                  frequency: 440 * Math.pow(2, (cleanMidi - 69) / 12),
+                  midi: cleanMidi,
+                  confidence: data.confidence,
+                });
+              } else {
+                recentMicMidisRef.current = [];
+                smoothedMidiRef.current = null;
+                livePitchRef.current = data;
+                setLivePitch(data);
+              }
+            },
+        !isPolyphonicInstrument
+      );
 
       cancelLoopDelay();
       currentLoopIterationRef.current = 1;
       isLoopDelayingRef.current = false;
       setLoopDelayCountdown(null);
       setMicActive(true);
+      isPracticingRef.current = true;
       setIsPracticing(true);
 
       if (audioRef.current) {
@@ -556,6 +602,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     } catch (err: any) {
       alert(`Microphone error: ${err.message || 'Please enable microphone access in your browser.'}`);
       setMicActive(false);
+      isPracticingRef.current = false;
       setIsPracticing(false);
     }
   };
@@ -563,14 +610,20 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const stopPracticeSession = async () => {
     cancelCountdown();
     cancelLoopDelay();
+    let recordedBlob: Blob | null = null;
     if (trackerRef.current) {
-      trackerRef.current.stop();
+      recordedBlob = await trackerRef.current.stopAndGetRecording();
     }
     if (audioRef.current) {
       audioRef.current.pause();
     }
     setMicActive(false);
+    isPracticingRef.current = false;
     setIsPracticing(false);
+    if (animRef.current) {
+      cancelAnimationFrame(animRef.current);
+      animRef.current = null;
+    }
     livePitchRef.current = null;
     recentMicMidisRef.current = [];
     smoothedMidiRef.current = null;
@@ -578,54 +631,113 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setShowPostBlindAnalysis(true);
     }
 
-    if (userPitchHistory.current.length > 0) {
-      setIsEvaluating(true);
-      try {
-        const evalTargetNotes =
-          practiceMode === 'note'
-            ? (selectedSectionNotes.length > 0 ? selectedSectionNotes : effectiveNotes)
-            : effectiveNotes;
-        const tolerance = studioType === 'instrument' ? 70.0 : 65.0;
-        const resp = await evaluatePractice(
-          evalTargetNotes,
-          userPitchHistory.current,
-          tolerance,
-          studioType,
-          practiceMode
-        );
-        setEvaluation(resp);
+    if (isPolyphonicInstrument) {
+      // Polyphonic Instrumental Evaluation: evaluates recorded audio take against chords and reference score
+      if (recordedBlob && recordedBlob.size > 800) {
+        setIsEvaluating(true);
+        try {
+          const mimeType = recordedBlob.type || 'audio/webm';
+          const extension = mimeType.includes('mp4') ? 'mp4' : (mimeType.includes('ogg') ? 'ogg' : 'webm');
+          const recordedFile = new File([recordedBlob], `polyphonic_performance.${extension}`, { type: mimeType });
+          const tolerance = 70.0;
+          const sectionStart = practiceMode === 'note' && rangeStartNote ? rangeStartNote.start : undefined;
+          const sectionEnd = practiceMode === 'note' && rangeEndNote ? rangeEndNote.end : undefined;
 
-        const currentSettings: PracticeConfigSettings = {
-          mode: practiceMode,
-          target_note_name: practiceMode === 'note' && rangeStartNote
-            ? (actualStartIdx === actualEndIdx
-              ? rangeStartNote.note_name
-              : `${rangeStartNote.note_name} → ${rangeEndNote?.note_name || rangeStartNote.note_name} (${selectedSectionNotes.length} notes)`)
-            : undefined,
-          target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
-          playback_speed: playbackSpeed,
-          transpose_semitones: transposeSemitones,
-          tolerance_cents: tolerance,
-        };
+          const resp = await evaluateRecordedPerformance(
+            audioId,
+            recordedFile,
+            tolerance,
+            transposeSemitones,
+            'instrument',
+            sectionStart,
+            sectionEnd
+          );
+          setEvaluation(resp);
 
-        const sessionAudio = audioInfo || {
-          id: audioId,
-          filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
-          duration: duration,
-        };
+          const currentSettings: PracticeConfigSettings = {
+            mode: practiceMode,
+            target_note_name: practiceMode === 'note' && rangeStartNote
+              ? (actualStartIdx === actualEndIdx
+                ? rangeStartNote.note_name
+                : `${rangeStartNote.note_name} → ${rangeEndNote?.note_name || rangeStartNote.note_name} (${selectedSectionNotes.length} notes)`)
+              : 'Polyphonic Instrumental Take',
+            target_midi: undefined,
+            playback_speed: playbackSpeed,
+            transpose_semitones: transposeSemitones,
+            tolerance_cents: tolerance,
+          };
 
-        recordPracticeSession(sessionAudio, currentSettings, resp);
-        await recordPerformanceToProject(
-          currentProjectId || audioId,
-          sessionAudio,
-          currentSettings,
-          resp
-        );
-        onPracticeModified?.();
-      } catch (err: any) {
-        console.error('Evaluation error:', err?.message || JSON.stringify(err));
-      } finally {
-        setIsEvaluating(false);
+          const sessionAudio = audioInfo || {
+            id: audioId,
+            filename: `${transcription.key_estimate || 'Instrument'}_practice.wav`,
+            duration: duration,
+          };
+
+          recordPracticeSession(sessionAudio, currentSettings, resp);
+          await recordPerformanceToProject(
+            currentProjectId || audioId,
+            sessionAudio,
+            currentSettings,
+            resp
+          );
+          onPracticeModified?.();
+        } catch (err: any) {
+          console.error('Polyphonic evaluation error:', err?.message || JSON.stringify(err));
+        } finally {
+          setIsEvaluating(false);
+        }
+      }
+    } else {
+      // Monophonic Evaluation (Live Sung / Played Frame History)
+      if (userPitchHistory.current.length > 0) {
+        setIsEvaluating(true);
+        try {
+          const evalTargetNotes =
+            practiceMode === 'note'
+              ? (selectedSectionNotes.length > 0 ? selectedSectionNotes : effectiveNotes)
+              : effectiveNotes;
+          const tolerance = studioType === 'instrument' ? 70.0 : 65.0;
+          const resp = await evaluatePractice(
+            evalTargetNotes,
+            userPitchHistory.current,
+            tolerance,
+            studioType,
+            practiceMode
+          );
+          setEvaluation(resp);
+
+          const currentSettings: PracticeConfigSettings = {
+            mode: practiceMode,
+            target_note_name: practiceMode === 'note' && rangeStartNote
+              ? (actualStartIdx === actualEndIdx
+                ? rangeStartNote.note_name
+                : `${rangeStartNote.note_name} → ${rangeEndNote?.note_name || rangeStartNote.note_name} (${selectedSectionNotes.length} notes)`)
+              : undefined,
+            target_midi: practiceMode === 'note' && selectedNote ? selectedNote.midi : undefined,
+            playback_speed: playbackSpeed,
+            transpose_semitones: transposeSemitones,
+            tolerance_cents: tolerance,
+          };
+
+          const sessionAudio = audioInfo || {
+            id: audioId,
+            filename: `${transcription.key_estimate || 'Melody'}_practice.wav`,
+            duration: duration,
+          };
+
+          recordPracticeSession(sessionAudio, currentSettings, resp);
+          await recordPerformanceToProject(
+            currentProjectId || audioId,
+            sessionAudio,
+            currentSettings,
+            resp
+          );
+          onPracticeModified?.();
+        } catch (err: any) {
+          console.error('Evaluation error:', err?.message || JSON.stringify(err));
+        } finally {
+          setIsEvaluating(false);
+        }
       }
     }
   };
@@ -682,14 +794,31 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
   // Canvas Real-time Render Loop
   const startCanvasRenderLoop = () => {
+    if (animRef.current) {
+      cancelAnimationFrame(animRef.current);
+      animRef.current = null;
+    }
     const render = () => {
       drawPracticeCanvas();
-      if (isPracticing) {
+      if (isPracticingRef.current) {
         animRef.current = requestAnimationFrame(render);
       }
     };
     animRef.current = requestAnimationFrame(render);
   };
+
+  useEffect(() => {
+    isPracticingRef.current = isPracticing;
+    if (isPracticing) {
+      startCanvasRenderLoop();
+    } else {
+      if (animRef.current) {
+        cancelAnimationFrame(animRef.current);
+        animRef.current = null;
+      }
+      drawPracticeCanvas();
+    }
+  }, [isPracticing]);
 
   // Helper to check if user sang near a reference contour point ONLY for already-passed timestamps
   const isReferencePointMatchedByUser = (
@@ -768,9 +897,13 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       const dpr = window.devicePixelRatio || 1;
       const width = canvas.clientWidth;
       const height = canvas.clientHeight;
-      canvas.width = width * dpr;
-      canvas.height = height * dpr;
-      ctx.scale(dpr, dpr);
+      const targetW = Math.round(width * dpr);
+      const targetH = Math.round(height * dpr);
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
       ctx.clearRect(0, 0, width, height);
 
@@ -1102,7 +1235,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         }
       });
 
-      const isLiveVoiced = isPracticing && !!currentLive?.isVoiced;
+      const isLiveVoiced = !isPolyphonicInstrument && isPracticing && !!currentLive?.isVoiced;
       const isTargetHit = isLiveVoiced && !!activeGateNote && Math.abs(currentLive.midi - activeGateNote.midi) <= 0.70;
 
       // 1. Draw Grid Rows & Left Piano Keyboard
@@ -1594,6 +1727,25 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               {blindMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
               <span>Blind Mode: {blindMode ? 'On' : 'Off'}</span>
             </button>
+
+            {/* Instrument Mode Domain Badge (Monophonic vs Polyphonic) */}
+            {studioType === 'instrument' && (
+              <div
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-mono font-semibold transition-all ${
+                  isPolyphonicInstrument
+                    ? 'bg-purple-950/70 border-purple-600/70 text-purple-300 shadow-sm'
+                    : 'bg-emerald-950/70 border-emerald-600/70 text-emerald-300 shadow-sm'
+                }`}
+                title={
+                  isPolyphonicInstrument
+                    ? 'Polyphonic chords detected: Real-time single pitch feedback is hidden. Full audio take is recorded and evaluated on completion.'
+                    : 'Monophonic melody detected: Real-time live pitch feedback and note tracking are fully active.'
+                }
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>{isPolyphonicInstrument ? 'Polyphonic (Take Scoring)' : 'Monophonic (Live Feedback)'}</span>
+              </div>
+            )}
           </div>
 
           <div className="text-xs text-slate-500">
@@ -1601,7 +1753,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
               ? 'Select start & end notes below to practice a section, or click any note to isolate it'
               : studioType === 'vocal'
                 ? 'Zoomed scrolling contour — center cursor tracks your voice in real time'
-                : 'Rhythm Gate mode — play notes accurately as they pass through the gate'}
+                : isPolyphonicInstrument
+                  ? 'Polyphonic mode — timeline runs normally while microphone records full take. Notes & chords evaluated on stop.'
+                  : 'Rhythm Gate mode — play notes accurately as they pass through the gate'}
           </div>
         </div>
 
@@ -1964,51 +2118,80 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             </div>
           </div>
         )}
-        {/* Live Pitch Gauge / Meter */}
-        <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800/80 grid grid-cols-1 md:grid-cols-4 gap-4 items-center">
-          {/* Note Display */}
-          <div className="flex items-center gap-3">
-            <span className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Sung Pitch:</span>
-            <div className="px-3 py-1 bg-slate-900 border border-slate-700 rounded-lg font-mono text-lg font-bold text-cyan-400">
-              {livePitch?.isVoiced ? livePitch.noteName : '--'}
+        {/* Live Pitch Gauge / Meter (Only in Monophonic Mode) or Polyphonic Audio Take Status */}
+        {isPolyphonicInstrument ? (
+          <div className="px-3.5 py-1.5 rounded-lg bg-purple-950/30 border border-purple-800/40 flex items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <Layers className="w-4 h-4 text-purple-400 shrink-0" />
+              <div className="flex items-center gap-2 truncate">
+                <span className="font-bold text-white font-mono text-xs tracking-wide shrink-0">
+                  Polyphonic Mode
+                </span>
+                <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-purple-900/70 text-purple-300 border border-purple-700/50 shrink-0">
+                  Chords
+                </span>
+                <span className="text-[11px] text-slate-400 truncate hidden sm:inline">
+                  • Full take recorded & evaluated on stop
+                </span>
+              </div>
             </div>
+            {isPracticing ? (
+              <div className="flex items-center gap-2 px-2.5 py-1 rounded-md bg-rose-950/90 border border-rose-600/80 text-rose-300 text-xs font-mono font-bold animate-pulse shrink-0">
+                <span className="w-2 h-2 rounded-full bg-rose-500 shadow-sm shadow-rose-500"></span>
+                RECORDING TAKE
+              </div>
+            ) : (
+              <span className="text-[11px] text-slate-400 font-mono shrink-0">
+                Press Space to start
+              </span>
+            )}
           </div>
+        ) : (
+          <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800/80 grid grid-cols-1 md:grid-cols-4 gap-4 items-center">
+            {/* Note Display */}
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-slate-400 uppercase tracking-wider font-semibold">Sung Pitch:</span>
+              <div className="px-3 py-1 bg-slate-900 border border-slate-700 rounded-lg font-mono text-lg font-bold text-cyan-400">
+                {livePitch?.isVoiced ? livePitch.noteName : '--'}
+              </div>
+            </div>
 
-          {/* Frequency (Hz) */}
-          <div className="text-xs text-slate-300 font-mono">
-            <span className="text-slate-500">Frequency: </span>
-            <strong>{livePitch?.isVoiced ? `${livePitch.frequency} Hz` : '--'}</strong>
-          </div>
+            {/* Frequency (Hz) */}
+            <div className="text-xs text-slate-300 font-mono">
+              <span className="text-slate-500">Frequency: </span>
+              <strong>{livePitch?.isVoiced ? `${livePitch.frequency} Hz` : '--'}</strong>
+            </div>
 
-          {/* Cents Flat / Sharp Meter */}
-          <div className="md:col-span-2 space-y-1">
-            <div className="flex justify-between text-xs font-mono">
-              <span className={livePitch && livePitch.centsDeviation < -15 ? 'text-amber-400' : 'text-slate-500'}>
-                Flat (-50¢)
-              </span>
-              <span className={livePitch && Math.abs(livePitch.centsDeviation) <= 15 ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
-                In Tune ({livePitch?.isVoiced ? (livePitch.centsDeviation > 0 ? `+${livePitch.centsDeviation}` : livePitch.centsDeviation) : 0}¢)
-              </span>
-              <span className={livePitch && livePitch.centsDeviation > 15 ? 'text-amber-400' : 'text-slate-500'}>
-                Sharp (+50¢)
-              </span>
-            </div>
-            {/* Visual Balance Bar */}
-            <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden relative">
-              <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-slate-400 z-10"></div>
-              {livePitch?.isVoiced && (
-                <div
-                  className={`h-full transition-all duration-75 ${Math.abs(livePitch.centsDeviation) <= 15 ? 'bg-emerald-400' : 'bg-amber-400'
-                    }`}
-                  style={{
-                    width: `${Math.min(50, Math.abs(livePitch.centsDeviation))}%`,
-                    marginLeft: livePitch.centsDeviation >= 0 ? '50%' : `${50 - Math.min(50, Math.abs(livePitch.centsDeviation))}%`,
-                  }}
-                />
-              )}
+            {/* Cents Flat / Sharp Meter */}
+            <div className="md:col-span-2 space-y-1">
+              <div className="flex justify-between text-xs font-mono">
+                <span className={livePitch && livePitch.centsDeviation < -15 ? 'text-amber-400' : 'text-slate-500'}>
+                  Flat (-50¢)
+                </span>
+                <span className={livePitch && Math.abs(livePitch.centsDeviation) <= 15 ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
+                  In Tune ({livePitch?.isVoiced ? (livePitch.centsDeviation > 0 ? `+${livePitch.centsDeviation}` : livePitch.centsDeviation) : 0}¢)
+                </span>
+                <span className={livePitch && livePitch.centsDeviation > 15 ? 'text-amber-400' : 'text-slate-500'}>
+                  Sharp (+50¢)
+                </span>
+              </div>
+              {/* Visual Balance Bar */}
+              <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden relative">
+                <div className="absolute top-0 bottom-0 left-1/2 w-0.5 bg-slate-400 z-10"></div>
+                {livePitch?.isVoiced && (
+                  <div
+                    className={`h-full transition-all duration-75 ${Math.abs(livePitch.centsDeviation) <= 15 ? 'bg-emerald-400' : 'bg-amber-400'
+                      }`}
+                    style={{
+                      width: `${Math.min(50, Math.abs(livePitch.centsDeviation))}%`,
+                      marginLeft: livePitch.centsDeviation >= 0 ? '50%' : `${50 - Math.min(50, Math.abs(livePitch.centsDeviation))}%`,
+                    }}
+                  />
+                )}
+              </div>
             </div>
           </div>
-        </div>
+        )}
 
         {/* Practice Toolbar: Customizable Speed, Pre-Practice Countdown & Key Shift */}
         <div className="flex flex-wrap items-center justify-between gap-4 mt-4 pt-3 border-t border-slate-800/80">

@@ -30,8 +30,13 @@ export class MicPitchTracker {
   private history: LivePitchData[] = [];
   private onPitchCallback: ((data: LivePitchData) => void) | null = null;
   private recentMidis: number[] = [];
+  private mediaRecorder: MediaRecorder | null = null;
+  private recordedChunks: Blob[] = [];
 
-  public async start(onPitch: (data: LivePitchData) => void): Promise<void> {
+  public async start(
+    onPitch: ((data: LivePitchData) => void) | null,
+    enableRealTimePitch = true
+  ): Promise<void> {
     this.stop();
     this.history = [];
     this.recentMidis = [];
@@ -48,19 +53,88 @@ export class MicPitchTracker {
       },
     });
 
-    const source = this.audioCtx.createMediaStreamSource(this.mediaStream);
-    this.analyser = this.audioCtx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.analyser.smoothingTimeConstant = 0.0; // Hard real-time without artificial delay
-    source.connect(this.analyser);
+    // Continuous audio take recording for final evaluation
+    this.recordedChunks = [];
+    if (typeof MediaRecorder !== 'undefined' && this.mediaStream) {
+      try {
+        let mimeType = '';
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+          mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+          mimeType = 'audio/webm';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+          mimeType = 'audio/mp4';
+        } else if (MediaRecorder.isTypeSupported('audio/ogg')) {
+          mimeType = 'audio/ogg';
+        }
+        const options = mimeType ? { mimeType } : undefined;
+        this.mediaRecorder = new MediaRecorder(this.mediaStream, options);
+        this.mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            this.recordedChunks.push(e.data);
+          }
+        };
+        this.mediaRecorder.start(500);
+      } catch (err) {
+        console.warn('MediaRecorder could not be started:', err);
+      }
+    }
 
-    this.startTime = performance.now() / 1000;
-    this.isTracking = true;
-    this.loop();
+    if (enableRealTimePitch) {
+      const source = this.audioCtx.createMediaStreamSource(this.mediaStream);
+      this.analyser = this.audioCtx.createAnalyser();
+      this.analyser.fftSize = 2048;
+      this.analyser.smoothingTimeConstant = 0.0; // Hard real-time without artificial delay
+      source.connect(this.analyser);
+
+      this.startTime = performance.now() / 1000;
+      this.isTracking = true;
+      this.loop();
+    } else {
+      this.startTime = performance.now() / 1000;
+      this.isTracking = true;
+    }
+  }
+
+  public async stopAndGetRecording(): Promise<Blob | null> {
+    return new Promise<Blob | null>((resolve) => {
+      const mr = this.mediaRecorder;
+      if (mr && mr.state !== 'inactive') {
+        mr.onstop = () => {
+          const mimeType = mr.mimeType || 'audio/webm';
+          const blob = new Blob(this.recordedChunks, { type: mimeType });
+          this.recordedChunks = [];
+          this.mediaRecorder = null;
+          this.stop();
+          resolve(blob);
+        };
+        try {
+          mr.stop();
+        } catch {
+          this.stop();
+          resolve(null);
+        }
+      } else {
+        const mimeType = this.mediaRecorder?.mimeType || 'audio/webm';
+        const blob = this.recordedChunks.length > 0 ? new Blob(this.recordedChunks, { type: mimeType }) : null;
+        this.recordedChunks = [];
+        this.mediaRecorder = null;
+        this.stop();
+        resolve(blob);
+      }
+    });
   }
 
   public stop(): void {
     this.isTracking = false;
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      try {
+        this.mediaRecorder.stop();
+      } catch {
+        // ignore
+      }
+      this.mediaRecorder = null;
+    }
     if (this.animFrameId) {
       cancelAnimationFrame(this.animFrameId);
       this.animFrameId = null;

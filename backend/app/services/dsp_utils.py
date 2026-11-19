@@ -1,5 +1,5 @@
 import math
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Any
 import numpy as np
 import scipy.signal
 import soundfile as sf
@@ -14,13 +14,17 @@ def midi_to_hz(midi: float) -> float:
 
 def load_audio(filepath: str, target_sr: int = 22050) -> Tuple[np.ndarray, int, float]:
     """
-    Loads audio using soundfile. Converts to mono, removes DC bias, and resamples cleanly.
+    Loads audio using soundfile with librosa fallback. Converts to mono, removes DC bias, and resamples cleanly.
     Returns (samples_array, sample_rate, duration_seconds)
     """
-    data, sr = sf.read(filepath, dtype='float32')
-    # Stereo to mono
-    if data.ndim > 1:
-        data = np.mean(data, axis=1)
+    try:
+        data, sr = sf.read(filepath, dtype='float32')
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+    except Exception:
+        import librosa
+        data, sr = librosa.load(filepath, sr=target_sr, mono=True)
+        return data.astype(np.float32), sr, float(len(data)) / float(sr)
 
     # Remove DC bias to prevent pitch detection asymmetry
     dc_offset = float(np.mean(data))
@@ -196,34 +200,184 @@ def estimate_key_chroma(y: np.ndarray, sr: int) -> Tuple[str, str]:
 
     return f"{best_key} {best_mode}", best_mode
 
-def estimate_bpm_tempo(y: np.ndarray, sr: int) -> float:
+def estimate_bpm_tempo(
+    y: np.ndarray,
+    sr: int,
+    notes: Optional[List[Any]] = None
+) -> float:
     """
-    Estimates BPM using onset envelope autocorrelation.
+    Enterprise-grade Hybrid Tempo Engine:
+    1. Multi-band Mel-Scale Spectral Novelty (Onset Envelope with log compression).
+    2. Dynamic Tempogram with Log-Normal Human Tactus Prior (Ellis beat tracker).
+    3. Note Inter-Onset Intervals (IOI) Cross-Validation and Harmonic Multiplier Resolution.
+    4. Handles edge cases (short samples, unvoiced audio, extreme speeds).
     """
     try:
-        hop = 512
-        n_fft = 1024
-        _, _, Zxx = scipy.signal.stft(y, fs=sr, nperseg=n_fft, noverlap=n_fft - hop)
-        flux = np.maximum(0, np.diff(np.sum(np.abs(Zxx), axis=0)))
-        
-        # Autocorrelation of onset envelope
-        acorr = np.correlate(flux, flux, mode='full')
-        acorr = acorr[len(acorr)//2:]
-
-        # Range 50 BPM to 200 BPM
-        min_lag = int((60.0 / 200.0) * (sr / hop))
-        max_lag = int((60.0 / 50.0) * (sr / hop))
-
-        if max_lag <= min_lag or len(acorr) <= max_lag:
+        if y is None or len(y) < int(sr * 0.35):
             return 120.0
 
-        lag = min_lag + int(np.argmax(acorr[min_lag:max_lag]))
-        tempo = (60.0 * sr) / (lag * hop)
-        # Normalize to standard 60-180 range
-        while tempo < 70:
-            tempo *= 2
-        while tempo > 180:
-            tempo /= 2
-        return round(float(tempo), 1)
+        rms = float(np.sqrt(np.mean(y ** 2)))
+        if rms < 1e-4:
+            return 120.0
+
+        import librosa
+        import scipy.stats
+
+        # Stage 1: Mel-Scale Log-Novelty Onset Envelope
+        # Hop length 256 @ 22050 Hz gives ~86 fps high-resolution onset tracking
+        hop_length = 256
+        onset_env = librosa.onset.onset_strength(
+            y=y,
+            sr=sr,
+            hop_length=hop_length,
+            aggregate=np.median,
+            fmax=8000
+        )
+
+        if len(onset_env) < 16 or float(np.max(onset_env)) < 1e-4:
+            return 120.0
+
+        # Stage 2: Dual Estimation (Tempogram + Ellis DP Beat Tracker)
+        # 2A. Dynamic Tempogram without artificial prior clipping
+        tempos = librosa.feature.tempo(
+            onset_envelope=onset_env,
+            sr=sr,
+            hop_length=hop_length,
+            prior=None,
+            aggregate=None
+        )
+        tempogram_bpm = float(np.median(tempos)) if len(tempos) > 0 else 120.0
+
+        # 2B. Dynamic Programming Beat Tracker
+        dp_bpm, _ = librosa.beat.beat_track(
+            onset_envelope=onset_env,
+            sr=sr,
+            hop_length=hop_length
+        )
+        dp_bpm = float(np.atleast_1d(dp_bpm)[0])
+
+        # Form consensus from waveform analysis
+        if abs(tempogram_bpm - dp_bpm) <= 3.0:
+            audio_bpm = (tempogram_bpm + dp_bpm) / 2.0
+        else:
+            ratio = tempogram_bpm / max(1.0, dp_bpm)
+            if 1.85 <= ratio <= 2.15 or 0.45 <= ratio <= 0.55:
+                # If one is double/half tempo, prefer the DP tracker estimate
+                audio_bpm = dp_bpm if dp_bpm > 0 else tempogram_bpm
+            else:
+                audio_bpm = dp_bpm if dp_bpm > 0 else tempogram_bpm
+
+        # Stage 2C: High-Precision Parabolic Sub-Bin Interpolation
+        # Eliminates discrete frame quantization error (turns 64.6 -> 65.0)
+        acorr = librosa.autocorrelate(onset_env, max_size=int((60.0 / 38.0) * (sr / hop_length)))
+        if len(acorr) > 10:
+            target_lag = int(round((60.0 * sr) / (audio_bpm * hop_length)))
+            if 1 < target_lag < len(acorr) - 1:
+                w = 3
+                search_region = acorr[max(1, target_lag - w):min(len(acorr) - 1, target_lag + w + 1)]
+                if len(search_region) >= 3:
+                    local_k = max(1, target_lag - w) + int(np.argmax(search_region))
+                    y0, y1, y2 = float(acorr[local_k - 1]), float(acorr[local_k]), float(acorr[local_k + 1])
+                    denom = 2.0 * (2.0 * y1 - y0 - y2)
+                    if abs(denom) > 1e-6:
+                        delta = (y2 - y0) / denom
+                        refined_lag = local_k + delta
+                        if refined_lag > 0:
+                            audio_bpm = (60.0 * sr) / (refined_lag * hop_length)
+
+        # Stage 2D: Smart Tactus & Half-Time/Double-Time Resolver
+        # If detected tempo is in half-time zone (< 85 BPM), check if double tempo has an authentic local peak
+        if audio_bpm < 85.0 and len(acorr) > 10:
+            double_bpm = audio_bpm * 2.0
+            if 85.0 <= double_bpm <= 175.0:
+                half_lag = int(round((60.0 * sr) / (double_bpm * hop_length)))
+                full_lag = int(round((60.0 * sr) / (audio_bpm * hop_length)))
+                if 2 < half_lag < len(acorr) - 2 and full_lag < len(acorr):
+                    w = 3
+                    sub_region = acorr[half_lag - w:half_lag + w + 1]
+                    if len(sub_region) >= 3:
+                        local_k = (half_lag - w) + int(np.argmax(sub_region))
+                        # Must be a true local maximum peak in autocorrelation
+                        if acorr[local_k] > acorr[local_k - 1] and acorr[local_k] > acorr[local_k + 1]:
+                            # If sub-harmonic peak has strong energy (>= 45% of the full lag peak)
+                            if acorr[local_k] >= 0.45 * acorr[full_lag]:
+                                y0, y1, y2 = float(acorr[local_k - 1]), float(acorr[local_k]), float(acorr[local_k + 1])
+                                denom = 2.0 * (2.0 * y1 - y0 - y2)
+                                delta = (y2 - y0) / denom if abs(denom) > 1e-6 else 0.0
+                                audio_bpm = (60.0 * sr) / ((local_k + delta) * hop_length)
+
+        # Stage 3: Note Inter-Onset Interval (IOI) Cross-Validation
+        if notes and len(notes) >= 4:
+            starts = []
+            for n in notes:
+                st = getattr(n, 'start', None)
+                if st is None and isinstance(n, dict):
+                    st = n.get('start')
+                if st is not None:
+                    starts.append(float(st))
+            starts.sort()
+            iois = np.diff(starts)
+            # Filter realistic musical note intervals (16th notes to whole notes: 0.10s to 3.2s)
+            iois = iois[(iois >= 0.10) & (iois <= 3.2)]
+
+            if len(iois) >= 3:
+                raw_candidates = set()
+                # Test audio_bpm, half-time, and double-time, plus local micro-search
+                for mult in [0.5, 1.0, 2.0]:
+                    c = audio_bpm * mult
+                    if 45.0 <= c <= 225.0:
+                        for delta in [-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5]:
+                            cand = round(c + delta, 1)
+                            if 45.0 <= cand <= 225.0:
+                                raw_candidates.add(cand)
+
+                best_bpm = audio_bpm
+                min_loss = float('inf')
+
+                for cand in raw_candidates:
+                    beat_sec = 60.0 / cand
+                    # Standard musical grid divisions: 16th, triplet, 8th, dotted 8th, quarter, dotted quarter, half, whole
+                    subdivs = np.array([0.25, 0.333, 0.5, 0.667, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]) * beat_sec
+                    dists = [np.min(np.abs(ioi - subdivs)) / beat_sec for ioi in iois]
+                    ioi_err = float(np.mean(dists))
+
+                    # Penalize deviations from audio waveform consensus
+                    octave_diff = abs(np.log2(cand / audio_bpm))
+                    # Subtle tactus preference: if IOI alignment is equal, prefer 90-150 zone
+                    tactus_weight = 0.05 * abs(np.log2(cand / 120.0))
+                    total_loss = ioi_err + 0.35 * octave_diff + tactus_weight
+
+                    if total_loss < min_loss:
+                        min_loss = total_loss
+                        best_bpm = cand
+
+                audio_bpm = best_bpm
+
+        # Clean snapping to integer if within 0.15 BPM
+        if abs(audio_bpm - round(audio_bpm)) < 0.15:
+            final_bpm = float(round(audio_bpm))
+        else:
+            final_bpm = round(float(audio_bpm), 1)
+
+        return max(40.0, min(240.0, final_bpm))
+
     except Exception:
-        return 120.0
+        # Fallback to simple autocorrelation if advanced extraction fails
+        try:
+            hop = 512
+            n_fft = 1024
+            _, _, Zxx = scipy.signal.stft(y, fs=sr, nperseg=n_fft, noverlap=n_fft - hop)
+            flux = np.maximum(0, np.diff(np.sum(np.abs(Zxx), axis=0)))
+            acorr = np.correlate(flux, flux, mode='full')
+            acorr = acorr[len(acorr)//2:]
+            min_lag = int((60.0 / 200.0) * (sr / hop))
+            max_lag = int((60.0 / 50.0) * (sr / hop))
+            if max_lag <= min_lag or len(acorr) <= max_lag:
+                return 120.0
+            lag = min_lag + int(np.argmax(acorr[min_lag:max_lag]))
+            tempo = (60.0 * sr) / (lag * hop)
+            while tempo < 70: tempo *= 2
+            while tempo > 180: tempo /= 2
+            return round(float(tempo), 1)
+        except Exception:
+            return 120.0
