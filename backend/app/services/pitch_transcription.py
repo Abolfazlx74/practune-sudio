@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
@@ -24,6 +25,28 @@ TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
+_BASIC_PITCH_LOCK = threading.Lock()
+_CACHED_BASIC_PITCH_MODEL: Any = None
+
+def get_basic_pitch_model() -> Any:
+    """
+    Thread-safe lazy pre-loader & in-memory cache for Spotify Basic Pitch SavedModel.
+    Avoids re-importing TensorFlow and re-loading neural weights on every practice take.
+    """
+    global _CACHED_BASIC_PITCH_MODEL
+    if _CACHED_BASIC_PITCH_MODEL is None:
+        with _BASIC_PITCH_LOCK:
+            if _CACHED_BASIC_PITCH_MODEL is None:
+                try:
+                    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+                    from basic_pitch.inference import Model
+                    import basic_pitch
+                    model_path = Path(basic_pitch.__file__).parent / "saved_models" / "icassp_2022" / "nmp"
+                    _CACHED_BASIC_PITCH_MODEL = Model(str(model_path))
+                except Exception as exc:
+                    print(f"[Warning] Failed to preload basic pitch model: {exc}")
+    return _CACHED_BASIC_PITCH_MODEL
+
 def midi_to_note_info(midi_num: float) -> Tuple[str, int, float]:
     rounded_midi = int(round(midi_num))
     # FL Studio / Yamaha standard convention: MIDI 60 is C5, MIDI 69 is A5 (440Hz), MIDI 70 is A#5
@@ -45,12 +68,19 @@ def run_basic_pitch_transcription(
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     try:
         from basic_pitch.inference import predict
-        # onset_threshold=0.5, frame_threshold=0.3, minimum_note_length=60ms
+        cached_model = get_basic_pitch_model()
+        # onset_threshold=0.55, frame_threshold=0.32, minimum_note_length=60ms
+        predict_kwargs: Dict[str, Any] = {
+            "onset_threshold": 0.55,
+            "frame_threshold": 0.32,
+            "minimum_note_length": 60.0,
+        }
+        if cached_model is not None:
+            predict_kwargs["model_or_model_path"] = cached_model
+
         model_output, midi_data, note_events = predict(
             str(audio_path),
-            onset_threshold=0.5,
-            frame_threshold=0.3,
-            minimum_note_length=60.0,
+            **predict_kwargs
         )
     except Exception as exc:
         print(f"[Basic Pitch Warning] Inference failed: {exc}. Falling back to YIN.")
@@ -73,7 +103,15 @@ def run_basic_pitch_transcription(
         bends = ev[4] or []
 
         dur = round(end - start, 3)
-        if dur < 0.04:
+        if dur < 0.05:
+            continue
+
+        # Prune unphysical pitch ranges (transient cymbal/fret clicks > 2093Hz or sub-rumble < 27.5Hz)
+        if (midi_val > 96 or midi_val < 21) and (amp < 0.80 or dur < 0.25):
+            continue
+
+        # Prune low-confidence transient micro-glitches
+        if dur < 0.08 and amp < 0.45:
             continue
 
         note_name, octave, cents_dev = midi_to_note_info(midi_val)
@@ -107,6 +145,9 @@ def run_basic_pitch_transcription(
             if overlap >= min_dur * 0.70:
                 diff = n.midi - other.midi
                 if diff in [12, 24] and (n.confidence <= other.confidence * 1.05):
+                    is_ghost = True
+                    break
+                elif diff in [19, 31] and (n.confidence <= other.confidence * 0.85):
                     is_ghost = True
                     break
         if not is_ghost:
@@ -398,7 +439,6 @@ def transcribe_audio(
 
     y, sr, duration = load_audio(str(audio_path), target_sr=22050)
 
-    bpm = estimate_bpm_tempo(y, sr)
     key_est, scale_est = estimate_key_chroma(y, sr)
 
     # Determine engine based on user preference or source_type default:
@@ -411,6 +451,9 @@ def transcribe_audio(
     else:
         notes, pitch_frames, transitions, vibratos, is_mono, suit_warn = run_yin_transcription(y, sr)
         engine_name = "DSP YIN & Onset Tracker"
+
+    # Hybrid tempo estimation using Mel-scale novelty + Tempogram + Note IOI cross-validation
+    bpm = estimate_bpm_tempo(y, sr, notes=notes)
 
     conf_overall = round(float(np.mean([n.confidence for n in notes])), 2) if notes else 0.0
 

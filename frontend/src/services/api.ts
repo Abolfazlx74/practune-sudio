@@ -133,7 +133,9 @@ export async function evaluateRecordedPerformance(
   audioFile: File,
   toleranceCents = 50.0,
   transposeSemitones = 0,
-  studioType: 'vocal' | 'instrument' = 'vocal'
+  studioType: 'vocal' | 'instrument' = 'vocal',
+  sectionStart?: number,
+  sectionEnd?: number
 ): Promise<EvaluationResponse> {
   const formData = new FormData();
   formData.append('audio_id', audioId);
@@ -141,6 +143,12 @@ export async function evaluateRecordedPerformance(
   formData.append('tolerance_cents', toleranceCents.toString());
   formData.append('transpose_semitones', transposeSemitones.toString());
   formData.append('studio_type', studioType);
+  if (sectionStart !== undefined && sectionStart !== null) {
+    formData.append('section_start', sectionStart.toString());
+  }
+  if (sectionEnd !== undefined && sectionEnd !== null) {
+    formData.append('section_end', sectionEnd.toString());
+  }
 
   const res = await fetch(`${API_BASE}/practice/evaluate-recording`, {
     method: 'POST',

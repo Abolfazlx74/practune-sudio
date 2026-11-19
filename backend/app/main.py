@@ -42,6 +42,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+def startup_event():
+    import threading
+    from .services.pitch_transcription import get_basic_pitch_model
+    threading.Thread(target=get_basic_pitch_model, daemon=True, name="BasicPitchPreloader").start()
+
 @app.get("/")
 def root():
     return {
@@ -195,7 +201,9 @@ async def evaluate_recorded_file(
     file: UploadFile = File(...),
     tolerance_cents: float = Form(50.0),
     transpose_semitones: int = Form(0),
-    studio_type: str = Form("vocal")
+    studio_type: str = Form("vocal"),
+    section_start: Optional[float] = Form(None),
+    section_end: Optional[float] = Form(None)
 ):
     try:
         content = await file.read()
@@ -205,7 +213,9 @@ async def evaluate_recorded_file(
             filename=file.filename or "recording.wav",
             tolerance_cents=tolerance_cents,
             transpose_semitones=transpose_semitones,
-            studio_type=studio_type
+            studio_type=studio_type,
+            section_start=section_start,
+            section_end=section_end
         )
         return resp
     except ValueError as ve:

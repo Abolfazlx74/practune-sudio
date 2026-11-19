@@ -11,7 +11,11 @@ export interface LivePitchData {
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-function midiToNote(midi: number): { noteName: string; octave: number; cents: number } {
+export function isValidInstrumentalNoteOnset(data: LivePitchData, noiseFloor = 0.012): boolean {
+  return data.isVoiced && data.rms >= noiseFloor && data.confidence >= 0.50 && data.frequency >= 55;
+}
+
+export function midiToNote(midi: number): { noteName: string; octave: number; cents: number } {
   const rounded = Math.round(midi);
   // FL Studio standard: MIDI 60 is C5, MIDI 69 is A5 (440Hz), MIDI 70 is A#5
   const octave = Math.floor(rounded / 12);

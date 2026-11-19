@@ -345,34 +345,28 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     perf_times = np.array([f.time for f in valid_frames], dtype=np.float64)
     perf_midis = np.array([f.midi for f in valid_frames], dtype=np.float64)
 
-    # 2. Constrained Global Latency / Alignment Search (-250ms to +250ms)
-    candidate_offsets = np.linspace(-0.25, 0.25, 101)  # 5ms steps
+    # 2. Latency / Time Alignment via Multi-Voice Energy & Pitch Cross-Search
+    candidate_offsets = np.arange(-0.50, 0.505, 0.005)  # 5ms steps across ±500ms
     best_offset = 0.0
     best_cost = float("inf")
 
-    max_overlap = 0
-    for off in candidate_offsets:
-        cnt = 0
-        for n in ref_notes:
-            cnt += int(np.sum((perf_times >= n.start + off) & (perf_times <= n.end + off)))
-        if cnt > max_overlap:
-            max_overlap = cnt
+    note_starts = np.array([n.start for n in ref_notes], dtype=np.float64)
+    note_ends = np.array([n.end for n in ref_notes], dtype=np.float64)
+    note_midis = np.array([n.midi for n in ref_notes], dtype=np.float64)
 
     for off in candidate_offsets:
-        cost_sum = 0.0
-        overlap_count = 0
-        for n in ref_notes:
-            mask = (perf_times >= n.start + off) & (perf_times <= n.end + off)
-            if np.any(mask):
-                raw_diff = np.abs(perf_midis[mask] - n.midi)
-                oct_diff = np.minimum(raw_diff, np.minimum(np.abs(raw_diff - 12.0), np.abs(raw_diff + 12.0)))
-                cost_sum += float(np.sum(oct_diff))
-                overlap_count += int(np.sum(mask))
-        if overlap_count >= max(1, int(max_overlap * 0.85)):
-            reg_cost = (cost_sum / overlap_count) + abs(off) * 0.5
-            if reg_cost < best_cost:
-                best_cost = reg_cost
-                best_offset = float(off)
+        t_ref = perf_times - off
+        frame_costs = np.full(len(perf_times), 3.5, dtype=np.float64)
+        for ns, ne, nm in zip(note_starts, note_ends, note_midis):
+            m = (t_ref >= ns) & (t_ref <= ne)
+            if np.any(m):
+                raw_d = np.abs(perf_midis[m] - nm)
+                oct_d = np.minimum(raw_d, np.minimum(np.abs(raw_d - 12.0), np.abs(raw_d + 12.0)))
+                frame_costs[m] = np.minimum(frame_costs[m], oct_d)
+        cost = float(np.mean(frame_costs)) + abs(off) * 0.015
+        if cost < best_cost:
+            best_cost = cost
+            best_offset = float(off)
 
     aligned_times = perf_times - best_offset
 
@@ -384,11 +378,13 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             overlapping_diffs.extend((perf_midis[mask] - n.midi).tolist())
 
     global_octave_shift = 0
-    if overlapping_diffs:
-        med_raw_diff = float(np.median(overlapping_diffs))
-        if abs(med_raw_diff - 12.0) <= 1.8:
+    if overlapping_diffs and studio_type != "instrument":
+        diff_arr = np.array(overlapping_diffs)
+        frac_plus_12 = float(np.mean(np.abs(diff_arr - 12.0) <= 1.2))
+        frac_minus_12 = float(np.mean(np.abs(diff_arr + 12.0) <= 1.2))
+        if frac_plus_12 >= 0.65:
             global_octave_shift = 12
-        elif abs(med_raw_diff + 12.0) <= 1.8:
+        elif frac_minus_12 >= 0.65:
             global_octave_shift = -12
 
     # 4. Note-by-Note Evaluation with Strict Windowing (No Adjacent Bleeding)
@@ -442,19 +438,45 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
         matched_times = aligned_times[mask]
 
         # Apply global or local octave adjustment
+        # In Instrument Mode, chord notes often exist at intervals of 7ths (11 semitones) or 9ths (13 semitones).
+        # We must NOT fold adjacent chord tones with a loose ±1.5 semitone window into an octave shift!
         adjusted_midis = []
         for m in matched_midis:
             adj = m - global_octave_shift
             diff = adj - note.midi
-            if abs(diff - 12.0) <= 1.5:
+            oct_tol = 0.65 if studio_type == "instrument" else 1.50
+            if abs(diff - 12.0) <= oct_tol:
                 adj -= 12.0
-            elif abs(diff + 12.0) <= 1.5:
+            elif abs(diff + 12.0) <= oct_tol:
                 adj += 12.0
+            elif studio_type == "instrument" and abs(diff - 24.0) <= oct_tol:
+                adj -= 24.0
+            elif studio_type == "instrument" and abs(diff + 24.0) <= oct_tol:
+                adj += 24.0
             adjusted_midis.append(adj)
         adjusted_midis = np.array(adjusted_midis, dtype=np.float64)
 
         # Discard sub-harmonic / transient unvoiced noise (> 8 semitones off target)
-        core_mask = np.abs(adjusted_midis - note.midi) < 8.0
+        if studio_type == "instrument":
+            diff_from_target = np.abs(adjusted_midis - note.midi)
+            # Hierarchy:
+            # 1. Exact pitch match (within ±60 cents of target pitch) -> isolates the target note voice from concurrent chord tones
+            exact_pitch_mask = diff_from_target <= 0.60
+            # 2. Close intonation (within ±1.1 semitones)
+            close_pitch_mask = diff_from_target <= 1.10
+            # 3. Wrong note / adjacent key (within ±2.5 semitones)
+            wrong_note_mask = diff_from_target <= 2.50
+
+            if np.any(exact_pitch_mask):
+                core_mask = exact_pitch_mask
+            elif np.any(close_pitch_mask):
+                core_mask = close_pitch_mask
+            elif np.any(wrong_note_mask):
+                core_mask = wrong_note_mask
+            else:
+                core_mask = np.zeros(len(adjusted_midis), dtype=bool)
+        else:
+            core_mask = np.abs(adjusted_midis - note.midi) < 8.0
         if not np.any(core_mask):
             missed_notes_count += 1
             pitch_scores_list.append(0.0)
@@ -470,7 +492,8 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
                 is_hit=False,
                 score=0.0
             ))
-            feedback_items.append(f"Note {note.note_name} ({note.start:.1f}s) was sung with completely wrong pitch.")
+            verb = "played" if studio_type == "instrument" else "sung"
+            feedback_items.append(f"Note {note.note_name} at {note.start:.1f}s was missed or not {verb}.")
             continue
 
         detected_live_segments += 1
@@ -521,11 +544,15 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
 
             pitch_scores_list.append(pitch_score)
 
-            onset_diff_ms = abs(matched_times[0] - note.start) * 1000.0
-            if onset_diff_ms <= 90.0:
+            core_matched_times = matched_times[core_mask]
+            onset_frame_time = core_matched_times[0] if len(core_matched_times) > 0 else matched_times[0]
+            onset_diff_ms = abs(onset_frame_time - note.start) * 1000.0
+            if onset_diff_ms <= 115.0:
                 timing_score = 100.0
+            elif onset_diff_ms <= 220.0:
+                timing_score = max(70.0, 100.0 - (onset_diff_ms - 115.0) * 0.28)
             else:
-                timing_score = max(40.0, 100.0 - max(0.0, onset_diff_ms - 90.0) / 2.0)
+                timing_score = max(35.0, 70.0 - (onset_diff_ms - 220.0) * 0.20)
             timing_scores_list.append(timing_score)
 
             if is_hit:
@@ -559,11 +586,13 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
             pitch_scores_list.append(pitch_score)
 
             # Timing score for vocal: 110ms natural consonant/breath onset window
-            onset_diff_ms = abs(matched_times[0] - note.start) * 1000.0
-            if onset_diff_ms <= 110.0:
+            core_matched_times = matched_times[core_mask]
+            onset_frame_time = core_matched_times[0] if len(core_matched_times) > 0 else matched_times[0]
+            onset_diff_ms = abs(onset_frame_time - note.start) * 1000.0
+            if onset_diff_ms <= 115.0:
                 timing_score = 100.0
             else:
-                timing_score = max(40.0, 100.0 - max(0.0, onset_diff_ms - 110.0) / 2.2)
+                timing_score = max(40.0, 100.0 - max(0.0, onset_diff_ms - 115.0) / 2.2)
             timing_scores_list.append(timing_score)
 
             is_hit = abs(cents_err) <= eff_tolerance and pitch_score >= 55.0
@@ -600,9 +629,22 @@ def evaluate_performance(req: EvaluationRequest) -> EvaluationResponse:
     extra_notes_count = 0
     ref_silence_intervals: List[Tuple[float, float]] = []
     min_rest_gap = 0.50 if studio_type == "instrument" else 0.35
-    for i in range(len(ref_notes) - 1):
-        gap_start = ref_notes[i].end + 0.1
-        gap_end = ref_notes[i + 1].start - 0.1
+
+    # Merge overlapping note intervals to accurately find true polyphonic rests
+    sorted_intervals = sorted([(n.start, n.end) for n in ref_notes], key=lambda x: x[0])
+    merged_intervals: List[List[float]] = []
+    for s, e in sorted_intervals:
+        if not merged_intervals:
+            merged_intervals.append([s, e])
+        else:
+            if s <= merged_intervals[-1][1]:
+                merged_intervals[-1][1] = max(merged_intervals[-1][1], e)
+            else:
+                merged_intervals.append([s, e])
+
+    for i in range(len(merged_intervals) - 1):
+        gap_start = merged_intervals[i][1] + 0.1
+        gap_end = merged_intervals[i + 1][0] - 0.1
         if gap_end - gap_start >= min_rest_gap:
             ref_silence_intervals.append((gap_start, gap_end))
 
@@ -673,11 +715,14 @@ def evaluate_imported_performance(
     filename: str,
     tolerance_cents: float = 50.0,
     transpose_semitones: int = 0,
-    studio_type: str = "vocal"
+    studio_type: str = "vocal",
+    section_start: Optional[float] = None,
+    section_end: Optional[float] = None
 ) -> EvaluationResponse:
     """
     Imported Audio Performance Evaluator:
-    - Decodes and analyzes imported audio file using the exact same DSP YIN & Note Extractor.
+    - Decodes and analyzes imported audio file using DSP YIN or Spotify Basic Pitch (Neural).
+    - Supports polyphonic chords and note sequences.
     - Aligns with reference audio notes and computes high-precision performance metrics.
     - Returns EvaluationResponse including extracted performance pitch contour.
     """
@@ -709,14 +754,18 @@ def evaluate_imported_performance(
             pass
 
     target_notes = ref.notes
+    if section_start is not None and section_end is not None:
+        target_notes = [n for n in target_notes if n.end >= section_start - 0.05 and n.start <= section_end + 0.05]
+
     if transpose_semitones != 0:
         NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        target_notes = []
-        for n in ref.notes:
+        shifted_notes = []
+        for n in target_notes:
             shifted_m = n.midi + transpose_semitones
             octv = shifted_m // 12
             n_name = f"{NOTE_NAMES[shifted_m % 12]}{octv}"
-            target_notes.append(n.model_copy(update={"midi": shifted_m, "note_name": n_name}))
+            shifted_notes.append(n.model_copy(update={"midi": shifted_m, "note_name": n_name}))
+        target_notes = shifted_notes
 
     req = EvaluationRequest(
         reference_notes=target_notes,

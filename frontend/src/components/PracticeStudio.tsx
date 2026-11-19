@@ -19,9 +19,10 @@ import {
   Mic2,
   Piano,
   Upload,
+  Zap,
 } from 'lucide-react';
 import type { NoteItem, TranscriptionResult, EvaluationResponse, PitchFrame, AudioInfo, PracticeConfigSettings, Project } from '../types';
-import { MicPitchTracker } from '../services/micPitchTracker';
+import { MicPitchTracker, isValidInstrumentalNoteOnset } from '../services/micPitchTracker';
 import type { LivePitchData } from '../services/micPitchTracker';
 import { getAudioFileUrl, evaluatePractice, evaluateRecordedPerformance } from '../services/api';
 import { synth } from '../services/synth';
@@ -31,6 +32,44 @@ import { EvaluationModal } from './EvaluationModal';
 import { SmartHistoryModal } from './SmartHistoryModal';
 import { SmartMetronome } from './SmartMetronome';
 import type { MetronomeGridState } from './SmartMetronome';
+
+export function hasPolyphonicNotes(notes: NoteItem[]): boolean {
+  if (!notes || notes.length < 2) return false;
+  const sorted = [...notes].sort((a, b) => a.start - b.start);
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const cur = sorted[i];
+    const nxt = sorted[i + 1];
+    if (nxt.start < cur.end - 0.04) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function findSmartPhraseEndIndex(notes: NoteItem[], startIdx: number): number {
+  if (startIdx < 0 || startIdx >= notes.length) return startIdx;
+  const startNote = notes[startIdx];
+  let maxDur = startNote.duration;
+  for (let j = startIdx; j < Math.min(notes.length, startIdx + 8); j++) {
+    if (notes[j].duration > maxDur) {
+      maxDur = notes[j].duration;
+    }
+  }
+  const phraseTargetDuration = Math.max(1.8, maxDur * 1.5);
+  const targetEndSec = startNote.start + phraseTargetDuration;
+
+  let endIdx = startIdx;
+  for (let j = startIdx; j < notes.length; j++) {
+    const cur = notes[j];
+    if (cur.start <= targetEndSec || cur.start < notes[endIdx].end + 0.3) {
+      endIdx = j;
+    } else {
+      break;
+    }
+    if (endIdx - startIdx >= 11) break;
+  }
+  return endIdx;
+}
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -87,6 +126,15 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       setStudioType('instrument');
     }
   }, [isInstrumentLocked, studioType]);
+
+  // Check if current piece has genuine polyphony and should suppress real-time single-pitch indicator
+  const isPolyphonicInstrument = React.useMemo(() => {
+    if (studioType !== 'instrument') return false;
+    const engineStr = (transcription.transcription_engine || '').toLowerCase();
+    const isBasicPitch = engineStr.includes('basic') || engineStr.includes('spotify');
+    if (!isBasicPitch) return false;
+    return hasPolyphonicNotes(transcription.notes);
+  }, [studioType, transcription]);
   const [blindMode, setBlindMode] = useState<boolean>(false);
   const [showPostBlindAnalysis, setShowPostBlindAnalysis] = useState<boolean>(false);
 
@@ -103,6 +151,14 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   const [countdownDuration, setCountdownDuration] = useState<number>(3);
   const [countdownValue, setCountdownValue] = useState<number | null>(null);
   const countdownIntervalRef = useRef<number | null>(null);
+
+  // Start Trigger Mode (Timer countdown vs Auto-start on first note strike)
+  const [startTriggerMode, setStartTriggerMode] = useState<'timer' | 'first_note'>('timer');
+  const [isWaitingForFirstNote, setIsWaitingForFirstNote] = useState<boolean>(false);
+
+  // Range End Drag Handle states
+  const isDraggingEndMarkerRef = useRef<boolean>(false);
+  const [isHoveringEndMarker, setIsHoveringEndMarker] = useState<boolean>(false);
 
   // Practice Mode (Full Song vs Section / Range Mode)
   const [practiceMode, setPracticeMode] = useState<'full' | 'note'>('full');
@@ -417,7 +473,9 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
       }
 
       if (e.key === 'Escape') {
-        if (countdownValue !== null) {
+        if (isWaitingForFirstNote) {
+          cancelWaitingForFirstNote();
+        } else if (countdownValue !== null) {
           cancelCountdown();
         } else if (loopDelayCountdown !== null) {
           cancelLoopDelay();
@@ -426,6 +484,8 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         e.preventDefault();
         if (isPracticing) {
           stopPracticeSession();
+        } else if (isWaitingForFirstNote) {
+          cancelWaitingForFirstNote();
         } else if (countdownValue !== null) {
           cancelCountdown();
         } else {
@@ -435,7 +495,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPracticing, countdownValue, countdownEnabled, countdownDuration, loopDelayCountdown, practiceMode, rangeStartNote]);
+  }, [isPracticing, isWaitingForFirstNote, startTriggerMode, countdownValue, countdownEnabled, countdownDuration, loopDelayCountdown, practiceMode, rangeStartNote]);
 
   // Audio beep generator for studio countdown lead-in
   const playCountdownBeep = (isFinal: boolean) => {
@@ -450,6 +510,14 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     }
   };
 
+  const cancelWaitingForFirstNote = () => {
+    if (trackerRef.current) {
+      trackerRef.current.stop();
+      trackerRef.current = null;
+    }
+    setIsWaitingForFirstNote(false);
+  };
+
   const cancelCountdown = () => {
     if (countdownIntervalRef.current) {
       clearInterval(countdownIntervalRef.current);
@@ -458,9 +526,31 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     setCountdownValue(null);
   };
 
-  // Pre-Practice trigger with countdown logic
-  const handleStartPracticeClick = () => {
+  // Pre-Practice trigger with countdown logic or auto-start on first note strike
+  const handleStartPracticeClick = async () => {
     if (isPracticing) return;
+    if (isWaitingForFirstNote) {
+      cancelWaitingForFirstNote();
+      return;
+    }
+
+    if (startTriggerMode === 'first_note') {
+      try {
+        setIsWaitingForFirstNote(true);
+        const tracker = new MicPitchTracker();
+        trackerRef.current = tracker;
+        await tracker.start((data) => {
+          if (isValidInstrumentalNoteOnset(data)) {
+            setIsWaitingForFirstNote(false);
+            executeStartPractice(tracker, data);
+          }
+        });
+      } catch (err: any) {
+        alert('Microphone error: Please enable microphone access in your browser.');
+        setIsWaitingForFirstNote(false);
+      }
+      return;
+    }
 
     if (!countdownEnabled || countdownDuration <= 0) {
       executeStartPractice();
@@ -494,17 +584,18 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   };
 
   // Actual execution of practice session
-  const executeStartPractice = async () => {
+  const executeStartPractice = async (existingTracker?: MicPitchTracker, initialLive?: LivePitchData) => {
     try {
       userPitchHistory.current = [];
-      livePitchRef.current = null;
+      livePitchRef.current = initialLive || null;
       recentMicMidisRef.current = [];
       smoothedMidiRef.current = null;
       setShowPostBlindAnalysis(false);
-      const tracker = new MicPitchTracker();
+
+      const tracker = existingTracker || new MicPitchTracker();
       trackerRef.current = tracker;
 
-      await tracker.start((data) => {
+      const pitchHandler = (data: LivePitchData) => {
         if (data.isVoiced && audioRef.current) {
           const rawTime = audioRef.current.currentTime;
           // Compensate ~150ms round-trip audio/DSP latency
@@ -526,7 +617,16 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
           livePitchRef.current = data;
           setLivePitch(data);
         }
-      });
+      };
+
+      if (!existingTracker) {
+        await tracker.start(pitchHandler);
+      } else {
+        (tracker as any).onPitchCallback = pitchHandler;
+        if (initialLive && initialLive.isVoiced && audioRef.current) {
+          pitchHandler(initialLive);
+        }
+      }
 
       cancelLoopDelay();
       currentLoopIterationRef.current = 1;
@@ -554,13 +654,14 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
 
       startCanvasRenderLoop();
     } catch (err: any) {
-      alert(`Microphone error: ${err.message || 'Please enable microphone access in your browser.'}`);
+      alert('Microphone error: Please enable microphone access in your browser.');
       setMicActive(false);
       setIsPracticing(false);
     }
   };
 
   const stopPracticeSession = async () => {
+    cancelWaitingForFirstNote();
     cancelCountdown();
     cancelLoopDelay();
     if (trackerRef.current) {
@@ -1102,7 +1203,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         }
       });
 
-      const isLiveVoiced = isPracticing && !!currentLive?.isVoiced;
+      const isLiveVoiced = !isPolyphonicInstrument && isPracticing && !!currentLive?.isVoiced;
       const isTargetHit = isLiveVoiced && !!activeGateNote && Math.abs(currentLive.midi - activeGateNote.midi) <= 0.70;
 
       // 1. Draw Grid Rows & Left Piano Keyboard
@@ -1221,6 +1322,35 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         });
       }
 
+      // Render Draggable Range End Marker with Amber Handle
+      if (practiceMode === 'note' && rangeEndNote) {
+        const markerX = timeToX(rangeEndNote.end);
+        if (markerX >= PIANO_WIDTH && markerX <= width) {
+          ctx.save();
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 2.5;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(markerX, 0);
+          ctx.lineTo(markerX, axisY);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          // Amber Handle Flag at top
+          ctx.fillStyle = '#f59e0b';
+          ctx.shadowColor = '#f59e0b';
+          ctx.shadowBlur = 8;
+          ctx.beginPath();
+          ctx.moveTo(markerX, 2);
+          ctx.lineTo(markerX + 11, 8);
+          ctx.lineTo(markerX, 14);
+          ctx.closePath();
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.restore();
+        }
+      }
+
       // 4. Playhead Beam & Detection Gate
       const beamColor = isTargetHit ? '#39ff14' : isLiveVoiced ? '#ef4444' : '#38bdf8';
       ctx.strokeStyle = beamColor;
@@ -1324,7 +1454,7 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
   }, [currentTimeFromAudio(audioRef.current), transposeSemitones, practiceMode, rangeStartIndex, rangeEndIndex, studioType, blindMode, showPostBlindAnalysis, metronomeGrid]);
 
   // Click directly on canvas to select and audition a note
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas || effectiveNotes.length === 0) return;
     const rect = canvas.getBoundingClientRect();
@@ -1338,6 +1468,15 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
     const plotWidth = width - leftMargin;
     const anchorX = studioType === 'instrument' ? leftMargin + plotWidth * 0.25 : leftMargin + plotWidth * 0.45;
     const pixelsPerSecond = 145;
+
+    // Check if clicking near the draggable end marker
+    if (practiceMode === 'note' && rangeEndNote) {
+      const markerX = anchorX + (rangeEndNote.end - currentTime) * pixelsPerSecond;
+      if (Math.abs(clickX - markerX) <= 12) {
+        isDraggingEndMarkerRef.current = true;
+        return;
+      }
+    }
 
     const validContourMidis = rawContour.filter((p) => p.midi > 0).map((p) => p.midi);
     const allMidis = validContourMidis.length > 0 ? validContourMidis : effectiveNotes.map((n) => n.midi);
@@ -1362,8 +1501,10 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             setRangeEndIndex(i);
           }
         } else {
+          // Feature A: Smart range selection based on longest note window
+          const smartEnd = findSmartPhraseEndIndex(effectiveNotes, i);
           setRangeStartIndex(i);
-          setRangeEndIndex(i);
+          setRangeEndIndex(smartEnd);
         }
         if (practiceMode !== 'note') {
           setPracticeMode('note');
@@ -1376,6 +1517,53 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         break;
       }
     }
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas || effectiveNotes.length === 0) return;
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+
+    const width = canvas.clientWidth;
+    const currentTime = audioRef.current ? audioRef.current.currentTime : 0;
+    const leftMargin = studioType === 'instrument' ? 54 : 38;
+    const plotWidth = width - leftMargin;
+    const anchorX = studioType === 'instrument' ? leftMargin + plotWidth * 0.25 : leftMargin + plotWidth * 0.45;
+    const pixelsPerSecond = 145;
+
+    // Check hover on end marker
+    if (practiceMode === 'note' && rangeEndNote) {
+      const markerX = anchorX + (rangeEndNote.end - currentTime) * pixelsPerSecond;
+      const hovering = Math.abs(mouseX - markerX) <= 12;
+      if (hovering !== isHoveringEndMarker) {
+        setIsHoveringEndMarker(hovering);
+      }
+    } else if (isHoveringEndMarker) {
+      setIsHoveringEndMarker(false);
+    }
+
+    // Feature B: Draggable end marker with magnetic snapping
+    if (isDraggingEndMarkerRef.current) {
+      const hoverTime = currentTime + (mouseX - anchorX) / pixelsPerSecond;
+      let bestIdx = actualStartIdx;
+      let minDiff = Infinity;
+      for (let j = actualStartIdx; j < effectiveNotes.length; j++) {
+        const n = effectiveNotes[j];
+        const diffEnd = Math.abs(hoverTime - n.end);
+        const diffStart = Math.abs(hoverTime - n.start);
+        const curMin = Math.min(diffEnd, diffStart);
+        if (curMin < minDiff) {
+          minDiff = curMin;
+          bestIdx = j;
+        }
+      }
+      setRangeEndIndex(bestIdx);
+    }
+  };
+
+  const handleCanvasMouseUp = () => {
+    isDraggingEndMarkerRef.current = false;
   };
 
   return (
@@ -1403,9 +1591,14 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             <div>
               <h2 className="text-base font-semibold text-white flex items-center gap-2">
                 {studioType === 'instrument' ? 'Real-Time Instrument Practice Studio' : 'Real-Time Vocal Practice Studio'}
-                {isPracticing && (
+                {isPracticing && !isPolyphonicInstrument && (
                   <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-950 border border-emerald-700/60 text-emerald-400 font-mono animate-pulse">
                     LIVE TRACKING
+                  </span>
+                )}
+                {isPracticing && isPolyphonicInstrument && (
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-amber-950 border border-amber-700/60 text-amber-300 font-mono">
+                    POLYPHONIC RECORDING
                   </span>
                 )}
               </h2>
@@ -1767,12 +1960,18 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
                       >
                         -
                       </button>
-                      <span
-                        className="text-xs font-mono font-bold text-emerald-400 min-w-8 text-center select-none"
+                      <input
+                        type="number"
+                        min={0}
+                        max={99}
+                        value={loopRepeatCount}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          setLoopRepeatCount(isNaN(val) ? 0 : Math.max(0, Math.min(99, val)));
+                        }}
+                        className="w-12 px-1 py-0.5 text-xs font-mono font-bold text-center bg-slate-900 border border-slate-700 rounded text-emerald-400 focus:outline-none focus:border-emerald-500"
                         title={loopRepeatCount === 0 ? "0: Infinite continuous loop" : `${loopRepeatCount} repetition(s)`}
-                      >
-                        {loopRepeatCount === 0 ? '0 (∞)' : `${loopRepeatCount}x`}
-                      </span>
+                      />
                       <button
                         type="button"
                         onClick={() => setLoopRepeatCount((c) => Math.min(50, c + 1))}
@@ -2067,6 +2266,36 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
             </div>
           </div>
 
+          {/* Start Trigger Mode Toggle: Countdown Timer vs Auto-start on First Note Strike */}
+          <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 p-1 rounded-xl shadow-sm">
+            <button
+              type="button"
+              onClick={() => setStartTriggerMode('timer')}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                startTriggerMode === 'timer'
+                  ? 'bg-slate-800 text-cyan-300 shadow-sm'
+                  : 'text-slate-500 hover:text-slate-300'
+              }`}
+              title="Start with Countdown Lead-In Timer"
+            >
+              <Timer className="w-3.5 h-3.5" />
+              <span>Timer</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStartTriggerMode('first_note')}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                startTriggerMode === 'first_note'
+                  ? 'bg-emerald-950 border border-emerald-700/70 text-emerald-300 shadow-sm'
+                  : 'text-slate-500 hover:text-slate-300'
+              }`}
+              title="Auto-start session as soon as you strike your first note"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>First Note Strike</span>
+            </button>
+          </div>
+
           {/* Pre-Practice Countdown Setting (Toggleable, default 3s, customizable) */}
           <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 p-1 rounded-xl">
             <button
@@ -2159,10 +2388,39 @@ export const PracticeStudio: React.FC<PracticeStudioProps> = ({
         <div className="relative rounded-xl overflow-hidden border border-slate-800/90 bg-[#070b12]">
           <canvas
             ref={canvasRef}
-            onClick={handleCanvasClick}
-            className="w-full h-80 block cursor-pointer"
-            title="Click any note to select and practice it"
+            onMouseDown={handleCanvasMouseDown}
+            onMouseMove={handleCanvasMouseMove}
+            onMouseUp={handleCanvasMouseUp}
+            onMouseLeave={handleCanvasMouseUp}
+            className="w-full h-80 block"
+            style={{ cursor: isDraggingEndMarkerRef.current || isHoveringEndMarker ? 'col-resize' : 'pointer' }}
+            title="Click any note to select phrase, or drag the amber end marker to customize range"
           />
+
+          {/* Waiting for First Note HUD Overlay */}
+          {isWaitingForFirstNote && (
+            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-slate-950/85 backdrop-blur-md rounded-xl animate-fade-in select-none">
+              <div className="flex flex-col items-center gap-3">
+                <div className="p-4 rounded-full bg-emerald-950/80 border border-emerald-500/50 shadow-lg shadow-emerald-500/30 animate-pulse">
+                  <Mic className="w-12 h-12 text-emerald-400" />
+                </div>
+                <div className="text-2xl font-bold font-mono text-emerald-300 drop-shadow-[0_0_20px_rgba(16,185,129,0.5)]">
+                  Listening for First Note...
+                </div>
+                <p className="text-sm font-semibold tracking-wider text-slate-300">
+                  {practiceMode === 'note' && selectedNote
+                    ? `Play or sing note: ${selectedNote.note_name} to begin`
+                    : 'Play or sing your first note to start automatically!'}
+                </p>
+                <button
+                  onClick={cancelWaitingForFirstNote}
+                  className="mt-3 px-4 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-xs font-semibold text-slate-400 hover:text-white transition-all shadow-md"
+                >
+                  Cancel (Esc)
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Studio Countdown HUD Overlay */}
           {countdownValue !== null && (

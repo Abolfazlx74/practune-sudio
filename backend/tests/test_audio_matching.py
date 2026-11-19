@@ -377,6 +377,57 @@ def test_scenario_15_spotify_basic_pitch_neural_transcription():
     print(">>> PASS: Spotify Basic Pitch neural model extracted notes and polyphony successfully.")
 
 
+def test_scenario_16_polyphonic_chord_evaluation():
+    """16. Polyphonic Simultaneous Notes Evaluation in Instrument Mode."""
+    from app.models.schemas import NoteItem, PitchFrame, EvaluationRequest
+    from app.services.practice_service import evaluate_performance
+
+    # Chord: C4 (60) and G4 (67) sounding simultaneously at 1.0s - 2.0s
+    note_c4 = NoteItem(id="n1", note_name="C4", midi=60, octave=4, start=1.0, end=2.0, duration=1.0, frequency=261.63, confidence=1.0)
+    note_g4 = NoteItem(id="n2", note_name="G4", midi=67, octave=4, start=1.0, end=2.0, duration=1.0, frequency=392.00, confidence=1.0)
+    ref_chord = [note_c4, note_g4]
+
+    # User plays C4 only (missed G4)
+    perf_c4_only = [
+        PitchFrame(time=1.0 + i * 0.05, frequency=261.63, midi=60.0, confidence=0.95)
+        for i in range(18)
+    ]
+    req_partial = EvaluationRequest(
+        reference_notes=ref_chord,
+        performance_pitches=perf_c4_only,
+        tolerance_cents=70.0,
+        studio_type="instrument",
+        practice_mode="full"
+    )
+    resp_partial = evaluate_performance(req_partial)
+    print("\n--- [TEST 16] Polyphonic Chord Evaluation (Partial Hit) ---")
+    print(f"Overall: {resp_partial.overall_score}% | Missed: {resp_partial.missed_notes_count} | Hits: {len([ns for ns in resp_partial.note_scores if ns.is_hit])}")
+    assert resp_partial.missed_notes_count >= 1
+    hit_notes = [ns.target_note for ns in resp_partial.note_scores if ns.is_hit]
+    assert "C4" in hit_notes
+
+    # User plays both notes (multi-pitch / alternating frames)
+    perf_both = []
+    for i in range(18):
+        t = 1.0 + i * 0.05
+        # Interleave or include both pitches
+        perf_both.append(PitchFrame(time=t, frequency=261.63, midi=60.0, confidence=0.9))
+        perf_both.append(PitchFrame(time=t, frequency=392.00, midi=67.0, confidence=0.9))
+
+    req_full = EvaluationRequest(
+        reference_notes=ref_chord,
+        performance_pitches=perf_both,
+        tolerance_cents=70.0,
+        studio_type="instrument",
+        practice_mode="full"
+    )
+    resp_full = evaluate_performance(req_full)
+    print(f"Full Chord Match Overall: {resp_full.overall_score}% | Pitch: {resp_full.pitch_accuracy}%")
+    assert resp_full.overall_score >= 90.0
+    assert all(ns.is_hit for ns in resp_full.note_scores)
+    print(">>> PASS: Polyphonic simultaneous notes correctly isolated and scored independently.")
+
+
 if __name__ == "__main__":
     print("=" * 65)
     print("PRACTUNE STUDIO AUDIO MATCHING & EVALUATION ACCURACY TEST SUITE")
@@ -396,6 +447,7 @@ if __name__ == "__main__":
     test_scenario_13_note_to_note_mode_evaluation()
     test_scenario_14_instrument_mode_missed_or_wrong_notes()
     test_scenario_15_spotify_basic_pitch_neural_transcription()
+    test_scenario_16_polyphonic_chord_evaluation()
     print("\n" + "=" * 65)
-    print("ALL 15 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
+    print("ALL 16 AUDIO MATCHING & ENGINE VALIDATION TESTS PASSED WITH 100% SUCCESS!")
     print("=" * 65)
