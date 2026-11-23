@@ -8,6 +8,7 @@ import {
   FolderOpen,
   FileAudio,
   ChevronRight,
+  Mic,
 } from 'lucide-react';
 import type { AudioInfo, Project } from '../types';
 import { listRecentAudios, uploadAudio } from '../services/api';
@@ -16,6 +17,7 @@ import {
   generateAssetId,
   storeAudioBlob,
 } from '../services/projectService';
+import { AudioRecorderModal } from './AudioRecorderModal';
 
 interface DashboardProps {
   onSelectAudio: (audio: AudioInfo, file?: File) => void;
@@ -38,6 +40,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const [recentAudios, setRecentAudios] = useState<AudioInfo[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
+  const [isRecordingModalOpen, setIsRecordingModalOpen] = useState(false);
 
   useEffect(() => {
     async function loadData() {
@@ -179,6 +182,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
             Upload vocal or instrument audio to extract pitch contours, edit note matrices with NewTone-style smoothing, and sing along with real-time pitch feedback.
           </p>
           <div className="pt-2 flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setIsRecordingModalOpen(true)}
+              className="flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-rose-500 to-red-600 hover:from-rose-400 hover:to-red-500 text-white font-bold rounded-xl text-xs shadow-lg shadow-rose-500/25 transition-all cursor-pointer"
+            >
+              <Mic className="w-4 h-4" />
+              Record Audio
+            </button>
+
             <label className="cursor-pointer flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold rounded-xl text-xs shadow-lg shadow-cyan-500/25 transition-all">
               <Upload className="w-4 h-4" />
               Upload Audio File
@@ -222,6 +234,17 @@ export const Dashboard: React.FC<DashboardProps> = ({
           <div>
             <p className="text-base font-semibold text-white">Drag & drop your audio track here</p>
             <p className="text-xs text-slate-400 mt-1">Supports WAV, MP3, FLAC, and OGG formats</p>
+          </div>
+          <div className="flex items-center gap-2 pt-1">
+            <span className="text-xs text-slate-500">or</span>
+            <button
+              type="button"
+              onClick={() => setIsRecordingModalOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 hover:text-rose-200 text-xs font-semibold border border-rose-500/30 transition-all cursor-pointer"
+            >
+              <Mic className="w-3.5 h-3.5 text-rose-400" />
+              Record with Microphone
+            </button>
           </div>
         </div>
       </div>
@@ -303,6 +326,15 @@ export const Dashboard: React.FC<DashboardProps> = ({
           </div>
         )}
       </div>
+
+      <AudioRecorderModal
+        isOpen={isRecordingModalOpen}
+        onClose={() => setIsRecordingModalOpen(false)}
+        onRecordingComplete={(recordedFile) => {
+          setIsRecordingModalOpen(false);
+          triggerAudioImport(recordedFile);
+        }}
+      />
     </div>
   );
 };

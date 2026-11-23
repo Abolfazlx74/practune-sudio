@@ -169,7 +169,7 @@ def correct_pitch(audio_id: str, request: CorrectionRequest):
     corrected = simplify_and_correct_pitch(transcription, request)
     return corrected
 
-@app.post("/api/audio/{audio_id}/export/midi")
+@app.api_route("/api/audio/{audio_id}/export/midi", methods=["GET", "POST"])
 def export_midi(audio_id: str):
     transcription = get_transcription(audio_id)
     if not transcription:
@@ -177,7 +177,7 @@ def export_midi(audio_id: str):
     midi_path = export_to_midi(transcription)
     return FileResponse(path=str(midi_path), filename=f"{transcription.audio_id}.mid", media_type="audio/midi")
 
-@app.post("/api/audio/{audio_id}/export/musicxml")
+@app.api_route("/api/audio/{audio_id}/export/musicxml", methods=["GET", "POST"])
 def export_musicxml(audio_id: str):
     transcription = get_transcription(audio_id)
     if not transcription:
